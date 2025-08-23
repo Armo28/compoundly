@@ -20,20 +20,12 @@ function currency(n: number) {
   });
 }
 function compactCurrency(n: number) {
-  try {
-    return new Intl.NumberFormat(undefined, {
-      style: 'currency',
-      currency: 'CAD',
-      notation: 'compact',
-      maximumFractionDigits: 1,
-    }).format(n);
-  } catch {
-    const abs = Math.abs(n);
-    if (abs >= 1_000_000_000) return `CA$${(n / 1_000_000_000).toFixed(1).replace(/\.0$/, '')}B`;
-    if (abs >= 1_000_000) return `CA$${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
-    if (abs >= 1_000) return `CA$${(n / 1_000).toFixed(1).replace(/\.0$/, '')}K`;
-    return currency(n);
-  }
+  const abs = Math.abs(n);
+  const sign = n < 0 ? '-' : '';
+  if (abs >= 1_000_000_000) return `${sign}CA$${(abs / 1_000_000_000).toFixed(1).replace(/\.0$/, '')}B`;
+  if (abs >= 1_000_000) return `${sign}CA$${(abs / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
+  if (abs >= 1_000) return `${sign}CA$${(abs / 1_000).toFixed(1).replace(/\.0$/, '')}K`;
+  return currency(n);
 }
 function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n));
@@ -125,10 +117,10 @@ function DonutProgress({
   width = 144,
   height = 112,
   innerRadius = 26,
-  outerRadius = 38, // thicker ring
+  outerRadius = 38,
   caption = 'room filled',
 }: {
-  percent: number; // 0..100
+  percent: number;
   color?: string;
   bg?: string;
   width?: number;
@@ -166,7 +158,7 @@ function DonutProgress({
   );
 }
 
-/* =============== Auto-width number input (~10% longer than text) =============== */
+/* =============== Auto-width number input =============== */
 function AutoWidthNumberInput({
   value,
   onChange,
@@ -193,7 +185,6 @@ function AutoWidthNumberInput({
     const el = inputRef.current;
     if (!el) return;
     const cs = window.getComputedStyle(el);
-    // Build a canvas font string similar to the input
     const font = `${cs.fontStyle} ${cs.fontVariant} ${cs.fontWeight} ${cs.fontSize} / ${cs.lineHeight} ${cs.fontFamily}`;
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d');
@@ -202,14 +193,12 @@ function AutoWidthNumberInput({
 
     const txt = String(value || '');
     const metrics = ctx.measureText(txt);
-    // Include padding + border
     const padLeft = parseFloat(cs.paddingLeft) || 0;
     const padRight = parseFloat(cs.paddingRight) || 0;
     const borderLeft = parseFloat(cs.borderLeftWidth) || 0;
     const borderRight = parseFloat(cs.borderRightWidth) || 0;
 
     const contentWidth = metrics.width;
-    // Add 10% and the paddings/borders
     const target = contentWidth * 1.1 + padLeft + padRight + borderLeft + borderRight;
 
     setWidthPx(clamp(Math.round(target), minPx, maxPx));
@@ -235,7 +224,7 @@ function AutoWidthNumberInput({
   );
 }
 
-/* =============== Projection Chart (free-cursor tooltip) =============== */
+/* =============== Projection Chart =============== */
 function ProjectionChart({
   actual,
   projectedBase,
@@ -302,7 +291,7 @@ function ProjectionChart({
     const yClamped = clamp(y, paddingTop, height - paddingBottom);
     setHoverX(xClamped);
     setHoverY(yClamped);
-    setHoverValue(unscaleValue(yClamped)); // value at exact pointer height
+    setHoverValue(unscaleValue(yClamped));
   };
   const onMouseLeave = () => { setHoverX(null); setHoverY(null); setHoverValue(null); };
 
@@ -312,7 +301,6 @@ function ProjectionChart({
   let boxX = clamp(tipX + 10, paddingLeft, width - paddingRight - boxW);
   let boxY = clamp(tipY - boxH - 8, paddingTop, height - paddingBottom - boxH);
 
-  // x & y ticks
   const xMajors: { x: number; label: string }[] = [];
   const xMinors: number[] = [];
   {
@@ -363,11 +351,9 @@ function ProjectionChart({
         onMouseMove={onMouseMove}
         onMouseLeave={onMouseLeave}
       >
-        {/* axes */}
         <line x1={paddingLeft} y1={height - paddingBottom} x2={width - paddingRight} y2={height - paddingBottom} stroke="#e5e7eb" />
         <line x1={paddingLeft} y1={paddingTop} x2={paddingLeft} y2={height - paddingBottom} stroke="#e5e7eb" />
 
-        {/* grid + y labels */}
         {yTicks.map((t, i) => (
           <g key={`y-${i}`}>
             <line x1={paddingLeft} y1={t.y} x2={width - paddingRight} y2={t.y} stroke="#f3f4f6" />
@@ -377,7 +363,6 @@ function ProjectionChart({
           </g>
         ))}
 
-        {/* x ticks */}
         {xMinors.map((x, i) => (
           <g key={`x-minor-${i}`}>
             <line x1={x} y1={height - paddingBottom} x2={x} y2={height - paddingBottom + 6} stroke="#d1d5db" />
@@ -392,22 +377,18 @@ function ProjectionChart({
           </g>
         ))}
 
-        {/* area under actual */}
         {actualArea && <path d={actualArea} fill="#11182714" stroke="none" />}
 
-        {/* lines */}
         {actualLine && <path d={actualLine} fill="none" stroke="#111827" strokeWidth={2.5} />}
         {projLineCons && <path d={projLineCons} fill="none" stroke="#22c55e" strokeOpacity={0.5} strokeWidth={2.5} strokeDasharray="6 6" />}
         {projLineBase && <path d={projLineBase} fill="none" stroke="#22c55e" strokeOpacity={1} strokeWidth={3} strokeDasharray="6 6" />}
         {projLineAggr && <path d={projLineAggr} fill="none" stroke="#22c55e" strokeOpacity={0.5} strokeWidth={2.5} strokeDasharray="6 6" />}
 
-        {/* axis titles */}
         <text x={width / 2} y={height - 8} fontSize="11" textAnchor="middle" fill="#6b7280">Calendar Year</text>
         <text x={-58} y={height / 2} transform={`rotate(-90, -58, ${height / 2})`} fontSize="11" textAnchor="middle" fill="#6b7280">
           Portfolio value (CAD)
         </text>
 
-        {/* crosshair + tooltip at the mouse tip */}
         {hoverX != null && hoverY != null && hoverValue != null && (
           <>
             <line x1={hoverX} y1={paddingTop} x2={hoverX} y2={height - paddingBottom} stroke="#9ca3af" strokeDasharray="4 4" />
@@ -473,21 +454,9 @@ function useBrokerageRoomProgress(): BrokerageRoomProgress | null {
 
     async function fetchProgress() {
       try {
-        // TODO: replace with your real endpoint.
-        // const res = await fetch('/api/brokerage/room-progress', { cache: 'no-store' });
-        // const json = await res.json();
-        // if (mounted) setData(json as BrokerageRoomProgress);
-
-        // Mock demo data that “moves” a bit:
-        const baseTfsa = 2200;
-        const baseRrsp = 7400;
-        const jitter = Math.floor((Date.now() / 30000) % 50) * 10;
-        if (mounted) {
-          setData({
-            tfsaDepositedThisYear: baseTfsa + jitter,
-            rrspDepositedThisYear: baseRrsp + jitter,
-          });
-        }
+        const res = await fetch('/api/brokerage/room-progress', { cache: 'no-store' });
+        const json = await res.json();
+        if (mounted) setData(json as BrokerageRoomProgress);
       } catch {
         if (mounted) setData(null);
       }
@@ -503,22 +472,17 @@ function useBrokerageRoomProgress(): BrokerageRoomProgress | null {
 
 /* =============== Page =============== */
 export default function Home() {
-  // Demo totals for allocation
   const totalForDonut = 65000;
 
-  // ----- NEW: monthly contribution slider state -----
   const [monthly, setMonthly] = useState<number>(600);
 
-  // Build actual + projections (client-only demo)
   const actualSeries = useMemo(() => makeActualSeries(totalForDonut, 60), [totalForDonut]);
   const lastActual = actualSeries[actualSeries.length - 1]?.value ?? totalForDonut;
 
-  // Wire projections to current monthly slider value
   const projBase = useMemo(() => projectFrom(lastActual, 10, 0.06, monthly), [lastActual, monthly]);
   const projCons = useMemo(() => projectFrom(lastActual, 10, 0.035, monthly), [lastActual, monthly]);
   const projAggr = useMemo(() => projectFrom(lastActual, 10, 0.085, monthly), [lastActual, monthly]);
 
-  // Right column allocation
   const alloc = {
     TFSA: totalForDonut * 0.66,
     RRSP: totalForDonut * 0.34,
@@ -535,7 +499,6 @@ export default function Home() {
     { key: 'Other', value: alloc.OTHER, color: '#a78bfa' },
   ].filter(s => s.value > 0.0001);
 
-  // Contribution Room (user inputs + brokerage feed)
   const [tfsaRoom, setTfsaRoom] = useState<number>(6500);
   const [rrspRoom, setRrspRoom] = useState<number>(18000);
   const brokerage = useBrokerageRoomProgress();
@@ -550,9 +513,8 @@ export default function Home() {
     return rrspRoom > 0 ? clamp((dep / rrspRoom) * 100, 0, 100) : 0;
   }, [brokerage?.rrspDepositedThisYear, rrspRoom]);
 
-  // Fixed donut visual size used for aligning centers with the inputs
   const DONUT_W = 144;
-  const DONUT_H = 112; // aligns with input h-12
+  const DONUT_H = 112;
 
   return (
     <main className="min-h-screen bg-gray-50">
@@ -563,7 +525,6 @@ export default function Home() {
       </header>
 
       <div className="max-w-6xl mx-auto p-4 grid grid-cols-1 lg:grid-cols-3 gap-4">
-        {/* Left: Chart + Slider + Contribution Room */}
         <div className="lg:col-span-2 space-y-4">
           <ProjectionChart
             actual={actualSeries}
@@ -573,7 +534,6 @@ export default function Home() {
             years={10}
           />
 
-          {/* ----- NEW: Monthly Contribution Slider card ----- */}
           <div className="rounded-2xl border p-4 shadow-sm bg-white">
             <div className="flex items-center justify-between">
               <label className="text-sm font-medium">Monthly Contribution</label>
@@ -595,23 +555,19 @@ export default function Home() {
             </div>
           </div>
 
-          {/* ===== Contribution Room (below the slider) ===== */}
           <div className="rounded-2xl border p-4 shadow-sm bg-white">
             <div className="text-sm font-medium mb-3">Contribution Room — {CURRENT_YEAR}</div>
 
             <div className="space-y-8">
-              {/* TFSA row — input and donut share the same centerline */}
               <div className="flex items-center justify-start gap-4">
                 <div className="flex flex-col">
                   <label className="text-sm mb-2">TFSA room available for {CURRENT_YEAR}</label>
                   <div className="flex items-center gap-4">
-                    {/* Auto-width input ~10% longer than text */}
                     <AutoWidthNumberInput
                       value={tfsaRoom}
                       onChange={setTfsaRoom}
                       aria-label="TFSA room"
                       title="TFSA room for the current year"
-                      // centers align via items-center on the row container.
                       inputClassName="bg-white"
                     />
                     <div
@@ -640,7 +596,6 @@ export default function Home() {
                 </div>
               </div>
 
-              {/* RRSP row — same alignment rules */}
               <div className="flex items-center justify-start gap-4">
                 <div className="flex flex-col">
                   <label className="text-sm mb-2">RRSP room available for {CURRENT_YEAR}</label>
@@ -685,7 +640,6 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Right: Allocation + Totals */}
         <div className="space-y-4">
           <Donut slices={donutSlices} total={totalForDonut} />
           <div className="grid grid-cols-2 gap-3">
