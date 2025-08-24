@@ -1,19 +1,33 @@
 'use client';
+
 import { useEffect, useState } from 'react';
-import { supabase } from '@/lib/supabaseClient';
 import { useRouter } from 'next/navigation';
+import { supabase } from '../../../lib/supabaseClient';
 
 export default function AuthCallbackPage() {
   const router = useRouter();
-  const [msg, setMsg] = useState('Completing sign-in...');
+  const [msg, setMsg] = useState('Completing sign-in…');
 
   useEffect(() => {
     (async () => {
       try {
-        const { error } = await supabase.auth.exchangeCodeForSession(window.location.href);
-        if (error) { setMsg(`Error: ${error.message}`); return; }
-        setMsg('Signed in! Redirecting…');
-        router.replace('/');
+        // 1) Magic-link / recovery (hash tokens)
+        const res1 = await supabase.auth.getSessionFromUrl({ storeSession: true });
+        if (!res1.error) {
+          setMsg('Signed in! Redirecting…');
+          router.replace('/');
+          return;
+        }
+
+        // 2) PKCE / OAuth (?code=…)
+        const res2 = await supabase.auth.exchangeCodeForSession(window.location.href);
+        if (!res2.error) {
+          setMsg('Signed in! Redirecting…');
+          router.replace('/');
+          return;
+        }
+
+        setMsg(`Error: ${(res2.error || res1.error).message}`);
       } catch (e: any) {
         setMsg(`Error: ${e?.message ?? 'unknown'}`);
       }
