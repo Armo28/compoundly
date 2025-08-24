@@ -11,7 +11,7 @@ export default function AuthCallbackPage() {
   useEffect(() => {
     (async () => {
       try {
-        // 1) Magic-link / recovery (tokens live in URL hash)
+        // First: handle magic-link / recovery (tokens live in the URL hash)
         const res1 = await supabase.auth.getSessionFromUrl({ storeSession: true });
         if (!res1.error) {
           setMsg('Signed in! Redirecting…');
@@ -19,7 +19,7 @@ export default function AuthCallbackPage() {
           return;
         }
 
-        // 2) PKCE / OAuth (?code= in the query) as fallback
+        // Fallback: handle PKCE/OAuth (?code=… in query)
         const res2 = await supabase.auth.exchangeCodeForSession(window.location.href);
         if (!res2.error) {
           setMsg('Signed in! Redirecting…');

@@ -43,6 +43,7 @@ export default function LoginPage() {
                 onChange={(e) => setEmail(e.target.value)}
                 className="mt-1 w-full rounded-lg border px-3 py-2"
                 placeholder="you@example.com"
+                autoComplete="email"
               />
             </label>
             <button
@@ -66,3 +67,4 @@ export default function LoginPage() {
     </main>
   );
 }
+
