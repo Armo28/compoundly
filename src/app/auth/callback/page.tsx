@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { supabase } from '../../../lib/supabaseClient';
+import { supabase } from '@/lib/supabaseClient';
 
 export default function AuthCallbackPage() {
   const router = useRouter();
@@ -11,7 +11,7 @@ export default function AuthCallbackPage() {
   useEffect(() => {
     (async () => {
       try {
-        // 1) Magic-link & recovery (tokens in URL hash)
+        // 1) Magic-link / recovery (tokens live in URL hash)
         const res1 = await supabase.auth.getSessionFromUrl({ storeSession: true });
         if (!res1.error) {
           setMsg('Signed in! Redirecting…');
@@ -19,7 +19,7 @@ export default function AuthCallbackPage() {
           return;
         }
 
-        // 2) Fallback: PKCE/OAuth (?code= in query)
+        // 2) PKCE / OAuth (?code= in the query) as fallback
         const res2 = await supabase.auth.exchangeCodeForSession(window.location.href);
         if (!res2.error) {
           setMsg('Signed in! Redirecting…');
