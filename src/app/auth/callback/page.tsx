@@ -4,6 +4,14 @@ import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabaseClient';
 
+function parseHashTokens(hash: string) {
+  // hash like: #access_token=...&expires_in=...&refresh_token=...&token_type=bearer&...
+  const q = new URLSearchParams(hash.startsWith('#') ? hash.slice(1) : hash);
+  const access_token = q.get('access_token') || '';
+  const refresh_token = q.get('refresh_token') || '';
+  return { access_token, refresh_token };
+}
+
 export default function AuthCallbackPage() {
   const router = useRouter();
   const [msg, setMsg] = useState('Completing sign-in…');
@@ -11,23 +19,32 @@ export default function AuthCallbackPage() {
   useEffect(() => {
     (async () => {
       try {
-        // First: handle magic-link / recovery (tokens live in the URL hash)
-        const res1 = await supabase.auth.getSessionFromUrl({ storeSession: true });
-        if (!res1.error) {
+        const url = new URL(window.location.href);
+
+        // 1) Magic link case: tokens in the fragment/hash
+        if (url.hash && url.hash.includes('access_token')) {
+          const { access_token, refresh_token } = parseHashTokens(url.hash);
+          if (access_token && refresh_token) {
+            const { error } = await supabase.auth.setSession({ access_token, refresh_token });
+            if (error) throw error;
+            setMsg('Signed in! Redirecting…');
+            router.replace('/');
+            return;
+          }
+        }
+
+        // 2) PKCE / OAuth case: ?code= in the query
+        const code = url.searchParams.get('code');
+        if (code) {
+          const { error } = await supabase.auth.exchangeCodeForSession(url.toString());
+          if (error) throw error;
           setMsg('Signed in! Redirecting…');
           router.replace('/');
           return;
         }
 
-        // Fallback: handle PKCE/OAuth (?code=… in query)
-        const res2 = await supabase.auth.exchangeCodeForSession(window.location.href);
-        if (!res2.error) {
-          setMsg('Signed in! Redirecting…');
-          router.replace('/');
-          return;
-        }
-
-        setMsg(`Error: ${(res2.error || res1.error)?.message}`);
+        // Nothing we can handle
+        setMsg('No auth information in URL. Please try signing in again.');
       } catch (e: any) {
         setMsg(`Error: ${e?.message ?? 'unknown'}`);
       }
