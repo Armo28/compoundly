@@ -8,7 +8,7 @@ type BrokerageRoomProgress = { tfsaDepositedThisYear: number; rrspDepositedThisY
 
 const CURRENT_YEAR = new Date().getFullYear();
 
-/* ---------------- utils ---------------- */
+/* -------- utils -------- */
 function currency(n: number) {
   return n.toLocaleString(undefined, { style: 'currency', currency: 'CAD', maximumFractionDigits: 0 });
 }
@@ -48,7 +48,7 @@ function arcPath(cx:number,cy:number,rOuter:number,rInner:number,startAngle:numb
   ].join(' ');
 }
 
-/* -------------- donuts -------------- */
+/* -------- donuts -------- */
 function Donut({
   slices,total,width=360,height=220,innerRadius=58,outerRadius=90,title='Account Allocation',
 }:{
@@ -102,7 +102,7 @@ function DonutProgress({
   );
 }
 
-/* -------------- chart: ONE dashed projection -------------- */
+/* -------- chart (single dashed projection) -------- */
 function ProjectionChart({
   actual, projected, years=10, annualPct,
 }:{
@@ -226,11 +226,9 @@ function ProjectionChart({
           </g>
         ))}
 
-        {/* Actual */}
         {actualArea && <path d={actualArea} fill="#11182714" stroke="none" />}
         {actualLine && <path d={actualLine} fill="none" stroke="#111827" strokeWidth={2.3} />}
 
-        {/* Single dashed projection */}
         {projLine && <path d={projLine} fill="none" stroke="#22c55e" strokeOpacity={1} strokeWidth={2.6} strokeDasharray="6 6" />}
 
         <text x={width/2} y={height-8} fontSize="10" textAnchor="middle" fill="#6b7280">Calendar Year</text>
@@ -251,7 +249,7 @@ function ProjectionChart({
   );
 }
 
-/* -------------- demo data -------------- */
+/* -------- demo series -------- */
 function makeActualSeries(endValue:number, monthsBack=36){
   let val=endValue*0.45; const driftAnnual=0.06, volMonthly=0.05, contribGuess=600; let seed=12345;
   const rand=()=> (seed=(seed*1664525+1013904223)%4294967296)/4294967296;
@@ -292,11 +290,11 @@ function useBrokerageRoomProgress(): BrokerageRoomProgress | null {
   return data;
 }
 
-/* -------------- page -------------- */
+/* -------- page -------- */
 export default function Home() {
   const { session, loading } = useAuth();
 
-  // Thin sliders (global CSS-in-JS)
+  // Thin sliders (global)
   const sliderCss = (
     <style jsx global>{`
       input[type="range"].thin {
@@ -363,29 +361,31 @@ export default function Home() {
 
   const totalForDonut=65000;
 
-  // Actual data span (36 months -> ~3 years)
+  // ~3 years of actuals
   const monthsBackActual = 36;
-  const firstActualYear = CURRENT_YEAR - Math.round(monthsBackActual/12);
+  const firstActualYear = CURRENT_YEAR - Math.floor(monthsBackActual/12);
 
-  // controls
-  const [monthly,setMonthly]=useState<number>(600);
-  const [annualPct,setAnnualPct]=useState<number>(6); // 0–100%
+  // controls (defaults requested)
+  const [monthly,setMonthly]=useState<number>(1000);  // default $1000
+  const [annualPct,setAnnualPct]=useState<number>(10); // default 10%
 
-  // years of projection shown (future only)
-  const [yearsFuture,setYearsFuture]=useState<number>(10); // default 10y
-
-  // Auto-reset to 10y every Jan 1 (on load)
-  useEffect(() => {
-    const now = new Date();
-    if (now.getMonth() === 0 && now.getDate() === 1) {
-      setYearsFuture(10);
-    }
-  }, []);
-
-  // CAP: no projection beyond (firstActualYear + 30)
+  // Years into future that the user can view:
+  // cap = first actual year + 30
   const maxEndYear = firstActualYear + 30;
   const maxFutureYears = Math.max(0, maxEndYear - CURRENT_YEAR);
-  const clampedYearsFuture = Math.min(Math.max(yearsFuture, 1), maxFutureYears);
+
+  // minimum future window = 10 years (but if cap < 10, use the cap)
+  const minYearsFuture = Math.min(10, maxFutureYears || 10);
+
+  // start at 10 (or cap if smaller)
+  const [yearsFuture,setYearsFuture]=useState<number>(Math.min(10, maxFutureYears || 10));
+
+  // clamp the chosen value within [minYearsFuture, maxFutureYears]
+  const clampedYearsFuture = clamp(
+    yearsFuture,
+    Math.min(minYearsFuture, maxFutureYears || minYearsFuture),
+    maxFutureYears || minYearsFuture
+  );
 
   // series
   const actualSeries=useMemo(()=>makeActualSeries(totalForDonut, monthsBackActual),[totalForDonut]);
@@ -404,13 +404,11 @@ export default function Home() {
   const rrspPercent=useMemo(()=>{ const dep=brokerage?.rrspDepositedThisYear??0; return rrspRoom>0?clamp((dep/rrspRoom)*100,0,100):0; },[brokerage?.rrspDepositedThisYear,rrspRoom]);
   const DONUT_W=144, DONUT_H=112;
 
-  // Buttons
-  const canAddYears = clampedYearsFuture < maxFutureYears;
-  const canMinusYears = clampedYearsFuture > 1;
+  const canPlus = clampedYearsFuture < Math.max(minYearsFuture, maxFutureYears);
+  const canMinus = clampedYearsFuture > minYearsFuture;
 
-  const onAddFiveYears = () => setYearsFuture(prev => Math.min(prev + 5, maxFutureYears));
-  const onMinusFiveYears = () => setYearsFuture(prev => Math.max(prev - 5, 1));
-  const onResetTen = () => setYearsFuture(10);
+  const onAddFiveYears = () => setYearsFuture(prev => Math.min(prev + 5, Math.max(minYearsFuture, maxFutureYears)));
+  const onMinusFiveYears = () => setYearsFuture(prev => Math.max(prev - 5, minYearsFuture));
 
   return (
     <main className="max-w-6xl mx-auto p-3 sm:p-4 grid grid-cols-1 lg:grid-cols-3 gap-3 sm:gap-4">
@@ -419,33 +417,22 @@ export default function Home() {
       <div className="lg:col-span-2 space-y-4">
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
           <div className="text-sm text-gray-600">
-            First actual year: <span className="font-medium">{firstActualYear}</span> ·
-            &nbsp;Projection limit: <span className="font-medium">{maxEndYear}</span> ·
-            &nbsp;Showing: <span className="font-medium">{clampedYearsFuture}y</span>
+            Showing <span className="font-medium">{clampedYearsFuture}y</span> into the future
           </div>
           <div className="flex items-center gap-2">
             <button
               onClick={onMinusFiveYears}
-              disabled={!canMinusYears}
+              disabled={!canMinus}
               className="rounded-lg bg-gray-200 text-gray-900 px-3 py-1.5 text-sm disabled:opacity-40"
-              title="Reduce projection by 5 years"
             >
               – 5 years
             </button>
             <button
               onClick={onAddFiveYears}
-              disabled={!canAddYears}
+              disabled={!canPlus}
               className="rounded-lg bg-gray-900 text-white px-3 py-1.5 text-sm disabled:opacity-40"
-              title={`Extend projection by 5 years (max ${maxEndYear})`}
             >
               + 5 years
-            </button>
-            <button
-              onClick={onResetTen}
-              className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm"
-              title="Reset to 10 years"
-            >
-              Reset to 10y
             </button>
           </div>
         </div>
@@ -545,7 +532,7 @@ export default function Home() {
   );
 }
 
-/* -------------- small input helper -------------- */
+/* -------- input helper -------- */
 function AutoWidthNumberInput({
   value,onChange,minPx=96,maxPx=360,className='',inputClassName='',title,'aria-label':ariaLabel,
 }:{
