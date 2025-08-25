@@ -8,6 +8,7 @@ type BrokerageRoomProgress = { tfsaDepositedThisYear: number; rrspDepositedThisY
 
 const CURRENT_YEAR = new Date().getFullYear();
 
+/* ------------ utils ------------ */
 function currency(n: number) {
   return n.toLocaleString(undefined, { style: 'currency', currency: 'CAD', maximumFractionDigits: 0 });
 }
@@ -32,7 +33,7 @@ function polarToCartesian(cx: number, cy: number, r: number, angleDeg: number) {
   const rad = ((angleDeg - 90) * Math.PI) / 180;
   return { x: cx + r * Math.cos(rad), y: cy + r * Math.sin(rad) };
 }
-function arcPath(cx:number, cy:number, rOuter:number, rInner:number, startAngle:number, endAngle:number){
+function arcPath(cx:number,cy:number,rOuter:number,rInner:number,startAngle:number,endAngle:number){
   const startOuter = polarToCartesian(cx,cy,rOuter,endAngle);
   const endOuter   = polarToCartesian(cx,cy,rOuter,startAngle);
   const startInner = polarToCartesian(cx,cy,rInner,endAngle);
@@ -47,6 +48,7 @@ function arcPath(cx:number, cy:number, rOuter:number, rInner:number, startAngle:
   ].join(' ');
 }
 
+/* ------------ donut widgets ------------ */
 function Donut({
   slices, total, width = 360, height = 220, innerRadius = 58, outerRadius = 90, title = 'Account Allocation',
 }:{
@@ -100,51 +102,17 @@ function DonutProgress({
   );
 }
 
-function AutoWidthNumberInput({
-  value,onChange,minPx=96,maxPx=360,className='',inputClassName='',title,'aria-label':ariaLabel,
-}:{
-  value:number; onChange:(n:number)=>void; minPx?:number; maxPx?:number; className?:string; inputClassName?:string; title?:string; 'aria-label'?:string;
-}) {
-  const inputRef=useRef<HTMLInputElement|null>(null); const [widthPx,setWidthPx]=useState<number>(minPx);
-  useEffect(()=>{
-    const el=inputRef.current; if(!el) return; const cs=window.getComputedStyle(el);
-    const font=`${cs.fontStyle} ${cs.fontVariant} ${cs.fontWeight} ${cs.fontSize} / ${cs.lineHeight} ${cs.fontFamily}`;
-    const canvas=document.createElement('canvas'); const ctx=canvas.getContext('2d'); if(!ctx) return; ctx.font=font;
-    const txt=String(value||''); const metrics=ctx.measureText(txt); const padLeft=parseFloat(cs.paddingLeft)||0; const padRight=parseFloat(cs.paddingRight)||0; const borderLeft=parseFloat(cs.borderLeftWidth)||0; const borderRight=parseFloat(cs.borderRightWidth)||0;
-    const contentWidth=metrics.width; const target=contentWidth*1.1+padLeft+padRight+borderLeft+borderRight;
-    setWidthPx(clamp(Math.round(target),minPx,maxPx));
-  },[value]);
-  return (
-    <div className={className}>
-      <input
-        ref={inputRef}
-        type="number"
-        value={value}
-        aria-label={ariaLabel}
-        title={title}
-        onChange={(e)=>onChange(Math.max(0,+e.target.value))}
-        className={"border rounded-lg h-12 px-3 text-base leading-none focus:outline-none focus:ring-2 focus:ring-blue-500 "+inputClassName}
-        style={{ width: `${widthPx}px` }}
-      />
-    </div>
-  );
-}
-
-/** =========================
- *  Responsive SVG chart
- *  ========================= */
+/* ------------ responsive chart (one dashed projection) ------------ */
 function ProjectionChart({
   actual,
-  projectedBase,
-  projectedConservative,
-  projectedAggressive,
+  projected, // single projection series
   years = 10,
+  annualPct, // for legend
 }: {
   actual: { month: number; value: number }[];
-  projectedBase: { month: number; value: number }[];
-  projectedConservative: { month: number; value: number }[];
-  projectedAggressive: { month: number; value: number }[];
+  projected: { month: number; value: number }[];
   years?: number;
+  annualPct: number;
 }) {
   // container-driven width
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -167,7 +135,7 @@ function ProjectionChart({
   const [hoverY,setHoverY]=useState<number|null>(null);
   const [hoverValue,setHoverValue]=useState<number|null>(null);
 
-  const allPts=[...actual,...projectedBase,...projectedConservative,...projectedAggressive];
+  const allPts=[...actual, ...projected];
   const minX=Math.min(...allPts.map(p=>p.month),-12);
   const maxX=Math.max(...allPts.map(p=>p.month),years*12);
   const minY=Math.min(...allPts.map(p=>p.value),0);
@@ -192,9 +160,7 @@ function ProjectionChart({
 
   const actualLine=linePath(actual);
   const actualArea=areaPath(actual);
-  const projLineBase=linePath(projectedBase);
-  const projLineCons=linePath(projectedConservative);
-  const projLineAggr=linePath(projectedAggressive);
+  const projLine=linePath(projected);
 
   const svgRef=useRef<SVGSVGElement|null>(null);
   const clientToSvg=(evt:React.MouseEvent<SVGSVGElement>)=>{
@@ -246,7 +212,7 @@ function ProjectionChart({
             <svg width="44" height="8" viewBox="0 0 44 8" aria-hidden="true">
               <line x1="0" y1="4" x2="44" y2="4" stroke="#22c55e" strokeWidth="3" strokeDasharray="6 6" />
             </svg>
-            Projections: <span className="ml-1 text-gray-500">Conservative</span> · <span className="text-gray-900 font-medium">Base</span> · <span className="text-gray-500">Aggressive</span>
+            Projection @ <span className="font-medium">{annualPct}%</span> annual return
           </span>
         </div>
       </div>
@@ -279,11 +245,12 @@ function ProjectionChart({
           </g>
         ))}
 
+        {/* Actual */}
         {actualArea && <path d={actualArea} fill="#11182714" stroke="none" />}
         {actualLine && <path d={actualLine} fill="none" stroke="#111827" strokeWidth={2.3} />}
-        {projLineCons && <path d={projLineCons} fill="none" stroke="#22c55e" strokeOpacity={0.5} strokeWidth={2.3} strokeDasharray="6 6" />}
-        {projLineBase && <path d={projLineBase} fill="none" stroke="#22c55e" strokeOpacity={1} strokeWidth={2.6} strokeDasharray="6 6" />}
-        {projLineAggr && <path d={projLineAggr} fill="none" stroke="#22c55e" strokeOpacity={0.5} strokeWidth={2.3} strokeDasharray="6 6" />}
+
+        {/* Single dashed projection */}
+        {projLine && <path d={projLine} fill="none" stroke="#22c55e" strokeOpacity={1} strokeWidth={2.6} strokeDasharray="6 6" />}
 
         <text x={width/2} y={height-8} fontSize="10" textAnchor="middle" fill="#6b7280">Calendar Year</text>
         <text x={-54} y={height/2} transform={`rotate(-90, -54, ${height/2})`} fontSize="10" textAnchor="middle" fill="#6b7280">Portfolio value (CAD)</text>
@@ -303,7 +270,7 @@ function ProjectionChart({
   );
 }
 
-/** === Demo data + helpers === */
+/* ------------ demo data helpers ------------ */
 function makeActualSeries(endValue:number, monthsBack=60){
   let val=endValue*0.45; const driftAnnual=0.06, volMonthly=0.05, contribGuess=600; let seed=12345;
   const rand=()=> (seed=(seed*1664525+1013904223)%4294967296)/4294967296;
@@ -344,7 +311,7 @@ function useBrokerageRoomProgress(): BrokerageRoomProgress | null {
   return data;
 }
 
-/** === Page === */
+/* ------------ page ------------ */
 export default function Home() {
   const { session, loading } = useAuth();
 
@@ -369,21 +336,17 @@ export default function Home() {
   }
 
   const totalForDonut=65000;
+
+  // user controls
   const [monthly,setMonthly]=useState<number>(600);
+  const [annualPct, setAnnualPct] = useState<number>(6); // 0–100%
+
+  // series
   const actualSeries=useMemo(()=>makeActualSeries(totalForDonut,60),[totalForDonut]);
   const lastActual=actualSeries[actualSeries.length-1]?.value??totalForDonut;
-  const projBase=useMemo(()=>projectFrom(lastActual,10,0.06,monthly),[lastActual,monthly]);
-  const projCons=useMemo(()=>projectFrom(lastActual,10,0.035,monthly),[lastActual,monthly]);
-  const projAggr=useMemo(()=>projectFrom(lastActual,10,0.085,monthly),[lastActual,monthly]);
+  const projected=useMemo(()=>projectFrom(lastActual,10,annualPct/100,monthly),[lastActual,monthly,annualPct]);
 
   const alloc={ TFSA: totalForDonut*0.66, RRSP: totalForDonut*0.34, LIRA: 0, MARGIN: 0, OTHER: 0, overall: totalForDonut };
-  const donutSlices:Slice[]=[
-    { key:'TFSA', value:alloc.TFSA, color:'#34d399' },
-    { key:'RRSP', value:alloc.RRSP, color:'#60a5fa' },
-    { key:'LIRA', value:alloc.LIRA, color:'#fbbf24' },
-    { key:'Margin', value:alloc.MARGIN, color:'#f472b6' },
-    { key:'Other', value:alloc.OTHER, color:'#a78bfa' },
-  ].filter(s=>s.value>0.0001);
 
   const [tfsaRoom,setTfsaRoom]=useState<number>(6500);
   const [rrspRoom,setRrspRoom]=useState<number>(18000);
@@ -397,12 +360,12 @@ export default function Home() {
       <div className="lg:col-span-2 space-y-4">
         <ProjectionChart
           actual={actualSeries}
-          projectedBase={projBase}
-          projectedConservative={projCons}
-          projectedAggressive={projAggr}
+          projected={projected}
           years={10}
+          annualPct={annualPct}
         />
 
+        {/* Monthly contribution control */}
         <div className="rounded-2xl border p-4 shadow-sm bg-white">
           <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
             <label className="text-sm font-medium">Monthly Contribution</label>
@@ -421,6 +384,26 @@ export default function Home() {
           <div className="flex justify-between text-xs text-gray-400"><span>$0</span><span>$10,000</span></div>
         </div>
 
+        {/* Annual return control (0–100%) */}
+        <div className="rounded-2xl border p-4 shadow-sm bg-white">
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+            <label className="text-sm font-medium">Assumed Annual Return</label>
+            <div className="text-sm text-gray-600">{annualPct}%</div>
+          </div>
+          <input
+            type="range"
+            min={0}
+            max={100}
+            step={0.5}
+            value={annualPct}
+            onChange={(e)=>setAnnualPct(Math.max(0, Math.min(100, +e.target.value)))}
+            className="w-full mt-2"
+            aria-label="Annual return slider"
+          />
+          <div className="flex justify-between text-xs text-gray-400"><span>0%</span><span>100%</span></div>
+        </div>
+
+        {/* Contribution room cards */}
         <div className="rounded-2xl border p-4 shadow-sm bg-white">
           <div className="text-sm font-medium mb-3">Contribution Room — {CURRENT_YEAR}</div>
           <div className="space-y-8">
@@ -450,24 +433,22 @@ export default function Home() {
               </div>
             </div>
           </div>
-          <div className="text-xs text-gray-400 mt-6">
-            Replace the mock brokerage fetch with your API to update percentages automatically.
-          </div>
         </div>
       </div>
 
+      {/* Right column */}
       <div className="space-y-4">
         <Donut slices={[
-          { key:'TFSA',  value: totalForDonut*0.66, color:'#34d399' },
-          { key:'RRSP',  value: totalForDonut*0.34, color:'#60a5fa' },
-        ]} total={totalForDonut} />
+          { key:'TFSA',  value: alloc.TFSA, color:'#34d399' },
+          { key:'RRSP',  value: alloc.RRSP, color:'#60a5fa' },
+        ]} total={alloc.overall} />
         <div className="grid grid-cols-2 gap-3">
-          <Card title="TFSA" value={currency(totalForDonut*0.66)} />
-          <Card title="RRSP" value={currency(totalForDonut*0.34)} />
+          <Card title="TFSA" value={currency(alloc.TFSA)} />
+          <Card title="RRSP" value={currency(alloc.RRSP)} />
           <div className="rounded-2xl border p-4 bg-white text-sm text-gray-500 flex items-center justify-center">+ Add Account</div>
           <Card title="Margin" value={currency(0)} />
         </div>
-        <Card title="Total Invested" value={currency(totalForDonut)} subtitle="All accounts (demo data)" />
+        <Card title="Total Invested" value={currency(alloc.overall)} subtitle="All accounts (demo data)" />
       </div>
     </main>
   );
