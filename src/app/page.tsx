@@ -8,7 +8,7 @@ type BrokerageRoomProgress = { tfsaDepositedThisYear: number; rrspDepositedThisY
 
 const CURRENT_YEAR = new Date().getFullYear();
 
-/* ------------ utils ------------ */
+/* ---------------- utils ---------------- */
 function currency(n: number) {
   return n.toLocaleString(undefined, { style: 'currency', currency: 'CAD', maximumFractionDigits: 0 });
 }
@@ -30,15 +30,15 @@ function compactCurrency(n: number) {
 }
 function clamp(n: number, min: number, max: number) { return Math.max(min, Math.min(max, n)); }
 function polarToCartesian(cx: number, cy: number, r: number, angleDeg: number) {
-  const rad = ((angleDeg - 90) * Math.PI) / 180;
-  return { x: cx + r * Math.cos(rad), y: cy + r * Math.sin(rad) };
+  const rad=((angleDeg-90)*Math.PI)/180;
+  return { x: cx + r*Math.cos(rad), y: cy + r*Math.sin(rad) };
 }
 function arcPath(cx:number,cy:number,rOuter:number,rInner:number,startAngle:number,endAngle:number){
-  const startOuter = polarToCartesian(cx,cy,rOuter,endAngle);
-  const endOuter   = polarToCartesian(cx,cy,rOuter,startAngle);
-  const startInner = polarToCartesian(cx,cy,rInner,endAngle);
-  const endInner   = polarToCartesian(cx,cy,rInner,startAngle);
-  const large = endAngle - startAngle <= 180 ? 0 : 1;
+  const startOuter=polarToCartesian(cx,cy,rOuter,endAngle);
+  const endOuter=polarToCartesian(cx,cy,rOuter,startAngle);
+  const startInner=polarToCartesian(cx,cy,rInner,endAngle);
+  const endInner=polarToCartesian(cx,cy,rInner,startAngle);
+  const large=endAngle-startAngle<=180?0:1;
   return [
     `M ${startOuter.x} ${startOuter.y}`,
     `A ${rOuter} ${rOuter} 0 ${large} 0 ${endOuter.x} ${endOuter.y}`,
@@ -48,9 +48,9 @@ function arcPath(cx:number,cy:number,rOuter:number,rInner:number,startAngle:numb
   ].join(' ');
 }
 
-/* ------------ donut widgets ------------ */
+/* -------------- donuts -------------- */
 function Donut({
-  slices, total, width = 360, height = 220, innerRadius = 58, outerRadius = 90, title = 'Account Allocation',
+  slices,total,width=360,height=220,innerRadius=58,outerRadius=90,title='Account Allocation',
 }:{
   slices: Slice[]; total: number; width?: number; height?: number; innerRadius?: number; outerRadius?: number; title?: string;
 }) {
@@ -75,7 +75,7 @@ function Donut({
         </div>
       </div>
       <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-56 overflow-visible">
-        {paths.map(p => <path key={p.key} d={p.d} fill={p.color} opacity={0.95} />)}
+        {paths.map(p=><path key={p.key} d={p.d} fill={p.color} opacity={0.95} />)}
         <circle cx={cx} cy={cy} r={innerRadius-1} fill="#fff" />
         <text x={cx} y={cy-6} textAnchor="middle" fontSize="12" fill="#6b7280">Total</text>
         <text x={cx} y={cy+14} textAnchor="middle" fontSize="16" className="font-semibold" fill="#111827">{currency(total)}</text>
@@ -85,7 +85,7 @@ function Donut({
 }
 
 function DonutProgress({
-  percent, color='#2563eb', bg='#e5e7eb', width=144, height=112, innerRadius=26, outerRadius=38, caption='room filled',
+  percent,color='#2563eb',bg='#e5e7eb',width=144,height=112,innerRadius=26,outerRadius=38,caption='room filled',
 }:{
   percent:number;color?:string;bg?:string;width?:number;height?:number;innerRadius?:number;outerRadius?:number;caption?:string;
 }) {
@@ -102,40 +102,24 @@ function DonutProgress({
   );
 }
 
-/* ------------ responsive chart (one dashed projection) ------------ */
+/* -------------- chart: ONE dashed projection -------------- */
 function ProjectionChart({
-  actual,
-  projected, // single projection series
-  years = 10,
-  annualPct, // for legend
-}: {
-  actual: { month: number; value: number }[];
-  projected: { month: number; value: number }[];
-  years?: number;
-  annualPct: number;
+  actual, projected, years=10, annualPct,
+}:{
+  actual:{month:number;value:number}[];
+  projected:{month:number;value:number}[];
+  years?:number;
+  annualPct:number;
 }) {
-  // container-driven width
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const [width, setWidth] = useState<number>(360);
-  const height = 300;
-
-  useEffect(() => {
-    const el = containerRef.current;
-    if (!el) return;
-    const ro = new ResizeObserver((entries) => {
-      for (const entry of entries) setWidth(Math.max(320, Math.floor(entry.contentRect.width)));
-    });
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, []);
-
-  const paddingLeft = 84, paddingRight = 16, paddingTop = 16, paddingBottom = 44;
+  // Keep static drawing size for reliability; SVG scales with CSS.
+  const paddingLeft=84,paddingRight=16,paddingTop=16,paddingBottom=44;
+  const width=840, height=320;
 
   const [hoverX,setHoverX]=useState<number|null>(null);
   const [hoverY,setHoverY]=useState<number|null>(null);
   const [hoverValue,setHoverValue]=useState<number|null>(null);
 
-  const allPts=[...actual, ...projected];
+  const allPts=[...actual,...projected];
   const minX=Math.min(...allPts.map(p=>p.month),-12);
   const maxX=Math.max(...allPts.map(p=>p.month),years*12);
   const minY=Math.min(...allPts.map(p=>p.value),0);
@@ -144,18 +128,18 @@ function ProjectionChart({
   const innerW=width-paddingLeft-paddingRight;
   const innerH=height-paddingTop-paddingBottom;
 
-  const scaleX=(m:number)=>paddingLeft+((m-minX)*(innerW||1))/(maxX-minX||1);
-  const scaleY=(v:number)=>paddingTop+((maxY-v)*(innerH||1))/(maxY-minY||1);
+  const scaleX=(m:number)=>paddingLeft+(m-minX)*(innerW/(maxX-minX||1));
+  const scaleY=(v:number)=>paddingTop+(maxY-v)*(innerH/(maxY-minY||1));
 
   const linePath=(pts:{month:number;value:number}[]) =>
-    pts.length ? pts.map((p,i)=>`${i?'L':'M'} ${scaleX(p.month)} ${scaleY(p.value)}`).join(' ') : '';
+    pts.length ? pts.map((p,i)=>`${i?'L':'M'} ${scaleX(p.month).toFixed(1)} ${scaleY(p.value).toFixed(1)}`).join(' ') : '';
 
   const areaPath=(pts:{month:number;value:number}[])=>{
     if(!pts.length) return '';
     const baselineY=scaleY(minY);
     const first=pts[0], last=pts[pts.length-1];
     const line=linePath(pts);
-    return `${line} L ${scaleX(last.month)} ${baselineY} L ${scaleX(first.month)} ${baselineY} Z`;
+    return `${line} L ${scaleX(last.month).toFixed(1)} ${baselineY.toFixed(1)} L ${scaleX(first.month).toFixed(1)} ${baselineY.toFixed(1)} Z`;
   };
 
   const actualLine=linePath(actual);
@@ -186,21 +170,19 @@ function ProjectionChart({
   const boxY=clamp(tipY-boxH-8, paddingTop, height-paddingBottom-boxH);
 
   const xMajors:{x:number;label:string}[]=[]; const xMinors:number[]=[];
-  { const startYearIndex=Math.ceil(minX/12);
-    const endYearIndex=Math.floor(maxX/12);
+  { const startYearIndex=Math.ceil(minX/12); const endYearIndex=Math.floor(maxX/12);
     for(let y=startYearIndex;y<=endYearIndex;y++){
       const xPos=scaleX(y*12);
       if(y%2===0) xMajors.push({x:xPos,label:String(CURRENT_YEAR+y)}); else xMinors.push(xPos);
-    } }
-
-  const yTicks:{y:number;label:string}[]=(() => {
-    const out:{y:number;label:string}[]=[]; const count=4;
+    }
+  }
+  const yTicks:{y:number;label:string}[]=(()=>{ const out:{y:number;label:string}[]=[]; const count=4;
     for(let i=0;i<=count;i++){ const v=minY+(i*(maxY-minY))/count; out.push({y:scaleY(v),label:compactCurrency(v)}); }
     return out;
   })();
 
   return (
-    <div ref={containerRef} className="rounded-2xl border p-4 shadow-sm bg-white">
+    <div className="rounded-2xl border p-4 shadow-sm bg-white">
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-2">
         <div className="text-sm font-medium">Portfolio Value (Actual &amp; Projected)</div>
         <div className="flex flex-wrap items-center gap-3 text-xs text-gray-700">
@@ -270,7 +252,7 @@ function ProjectionChart({
   );
 }
 
-/* ------------ demo data helpers ------------ */
+/* -------------- demo data -------------- */
 function makeActualSeries(endValue:number, monthsBack=60){
   let val=endValue*0.45; const driftAnnual=0.06, volMonthly=0.05, contribGuess=600; let seed=12345;
   const rand=()=> (seed=(seed*1664525+1013904223)%4294967296)/4294967296;
@@ -311,7 +293,7 @@ function useBrokerageRoomProgress(): BrokerageRoomProgress | null {
   return data;
 }
 
-/* ------------ page ------------ */
+/* -------------- page -------------- */
 export default function Home() {
   const { session, loading } = useAuth();
 
@@ -337,9 +319,9 @@ export default function Home() {
 
   const totalForDonut=65000;
 
-  // user controls
+  // controls
   const [monthly,setMonthly]=useState<number>(600);
-  const [annualPct, setAnnualPct] = useState<number>(6); // 0–100%
+  const [annualPct,setAnnualPct]=useState<number>(6); // 0–100%
 
   // series
   const actualSeries=useMemo(()=>makeActualSeries(totalForDonut,60),[totalForDonut]);
@@ -365,7 +347,6 @@ export default function Home() {
           annualPct={annualPct}
         />
 
-        {/* Monthly contribution control */}
         <div className="rounded-2xl border p-4 shadow-sm bg-white">
           <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
             <label className="text-sm font-medium">Monthly Contribution</label>
@@ -384,7 +365,7 @@ export default function Home() {
           <div className="flex justify-between text-xs text-gray-400"><span>$0</span><span>$10,000</span></div>
         </div>
 
-        {/* Annual return control (0–100%) */}
+        {/* 0–100% annual return */}
         <div className="rounded-2xl border p-4 shadow-sm bg-white">
           <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
             <label className="text-sm font-medium">Assumed Annual Return</label>
@@ -403,7 +384,6 @@ export default function Home() {
           <div className="flex justify-between text-xs text-gray-400"><span>0%</span><span>100%</span></div>
         </div>
 
-        {/* Contribution room cards */}
         <div className="rounded-2xl border p-4 shadow-sm bg-white">
           <div className="text-sm font-medium mb-3">Contribution Room — {CURRENT_YEAR}</div>
           <div className="space-y-8">
@@ -419,7 +399,6 @@ export default function Home() {
                 <div className="text-xs text-gray-500 mt-2">Deposited so far: {currency(brokerage?.tfsaDepositedThisYear ?? 0)}</div>
               </div>
             </div>
-
             <div className="flex items-center justify-start gap-4">
               <div className="flex flex-col">
                 <label className="text-sm mb-2">RRSP room available for {CURRENT_YEAR}</label>
@@ -451,5 +430,38 @@ export default function Home() {
         <Card title="Total Invested" value={currency(alloc.overall)} subtitle="All accounts (demo data)" />
       </div>
     </main>
+  );
+}
+
+/* -------------- small input helper -------------- */
+function AutoWidthNumberInput({
+  value,onChange,minPx=96,maxPx=360,className='',inputClassName='',title,'aria-label':ariaLabel,
+}:{
+  value:number; onChange:(n:number)=>void; minPx?:number; maxPx?:number; className?:string; inputClassName?:string; title?:string; 'aria-label'?:string;
+}) {
+  const inputRef=useRef<HTMLInputElement|null>(null); const [widthPx,setWidthPx]=useState<number>(minPx);
+  useEffect(()=>{ const el=inputRef.current; if(!el) return;
+    const cs=window.getComputedStyle(el);
+    const font=`${cs.fontStyle} ${cs.fontVariant} ${cs.fontWeight} ${cs.fontSize} / ${cs.lineHeight} ${cs.fontFamily}`;
+    const canvas=document.createElement('canvas'); const ctx=canvas.getContext('2d'); if(!ctx) return; ctx.font=font;
+    const txt=String(value||''); const m=ctx.measureText(txt);
+    const padLeft=parseFloat(cs.paddingLeft)||0; const padRight=parseFloat(cs.paddingRight)||0;
+    const borderLeft=parseFloat(cs.borderLeftWidth)||0; const borderRight=parseFloat(cs.borderRightWidth)||0;
+    const target=m.width*1.1+padLeft+padRight+borderLeft+borderRight;
+    setWidthPx(clamp(Math.round(target),minPx,maxPx));
+  },[value]);
+  return (
+    <div className={className}>
+      <input
+        ref={inputRef}
+        type="number"
+        value={value}
+        aria-label={ariaLabel}
+        title={title}
+        onChange={(e)=>onChange(Math.max(0,+e.target.value))}
+        className={"border rounded-lg h-12 px-3 text-base leading-none focus:outline-none focus:ring-2 focus:ring-blue-500 "+inputClassName}
+        style={{ width: `${widthPx}px` }}
+      />
+    </div>
   );
 }
