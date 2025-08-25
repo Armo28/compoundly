@@ -111,7 +111,6 @@ function ProjectionChart({
   years?:number;
   annualPct:number;
 }) {
-  // Keep static drawing size for reliability; SVG scales with CSS.
   const paddingLeft=84,paddingRight=16,paddingTop=16,paddingBottom=44;
   const width=840, height=320;
 
@@ -194,7 +193,7 @@ function ProjectionChart({
             <svg width="44" height="8" viewBox="0 0 44 8" aria-hidden="true">
               <line x1="0" y1="4" x2="44" y2="4" stroke="#22c55e" strokeWidth="3" strokeDasharray="6 6" />
             </svg>
-            Projection @ <span className="font-medium">{annualPct}%</span> annual return
+            Projection @ <span className="font-medium">{annualPct}%</span>
           </span>
         </div>
       </div>
@@ -253,7 +252,7 @@ function ProjectionChart({
 }
 
 /* -------------- demo data -------------- */
-function makeActualSeries(endValue:number, monthsBack=60){
+function makeActualSeries(endValue:number, monthsBack=36){
   let val=endValue*0.45; const driftAnnual=0.06, volMonthly=0.05, contribGuess=600; let seed=12345;
   const rand=()=> (seed=(seed*1664525+1013904223)%4294967296)/4294967296;
   const pts:{month:number;value:number}[]=[];
@@ -297,9 +296,53 @@ function useBrokerageRoomProgress(): BrokerageRoomProgress | null {
 export default function Home() {
   const { session, loading } = useAuth();
 
+  // Thin sliders (global CSS-in-JS)
+  const sliderCss = (
+    <style jsx global>{`
+      input[type="range"].thin {
+        appearance: none;
+        width: 100%;
+        background: transparent;
+        padding: 0;
+        height: 16px;
+      }
+      input[type="range"].thin:focus { outline: none; }
+      input[type="range"].thin::-webkit-slider-runnable-track {
+        height: 4px;
+        background: #e5e7eb;
+        border-radius: 9999px;
+      }
+      input[type="range"].thin::-webkit-slider-thumb {
+        appearance: none;
+        margin-top: -6px;
+        width: 16px;
+        height: 16px;
+        border-radius: 9999px;
+        background: #2563eb;
+        border: 2px solid white;
+        box-shadow: 0 0 0 1px #d1d5db;
+      }
+      input[type="range"].thin::-moz-range-track {
+        height: 4px;
+        background: #e5e7eb;
+        border: none;
+        border-radius: 9999px;
+      }
+      input[type="range"].thin::-moz-range-thumb {
+        width: 16px;
+        height: 16px;
+        border: 2px solid white;
+        border-radius: 9999px;
+        background: #2563eb;
+        box-shadow: 0 0 0 1px #d1d5db;
+      }
+    `}</style>
+  );
+
   if (loading) {
     return (
       <main className="max-w-6xl mx-auto p-6">
+        {sliderCss}
         <div className="rounded-2xl border bg-white p-6 shadow-sm">Loading…</div>
       </main>
     );
@@ -308,6 +351,7 @@ export default function Home() {
   if (!session) {
     return (
       <main className="max-w-6xl mx-auto p-6">
+        {sliderCss}
         <div className="rounded-2xl border bg-white p-8 shadow-sm text-center">
           <h2 className="text-xl font-semibold mb-2">Welcome to Compoundly</h2>
           <p className="text-gray-600 mb-4">Please sign in to view your portfolio and projections.</p>
@@ -319,14 +363,37 @@ export default function Home() {
 
   const totalForDonut=65000;
 
+  // Actual data span (36 months -> ~3 years)
+  const monthsBackActual = 36;
+  const firstActualYear = CURRENT_YEAR - Math.round(monthsBackActual/12);
+
   // controls
   const [monthly,setMonthly]=useState<number>(600);
   const [annualPct,setAnnualPct]=useState<number>(6); // 0–100%
 
+  // years of projection shown (future only)
+  const [yearsFuture,setYearsFuture]=useState<number>(10); // default 10y
+
+  // Auto-reset to 10y every Jan 1 (on load)
+  useEffect(() => {
+    const now = new Date();
+    if (now.getMonth() === 0 && now.getDate() === 1) {
+      setYearsFuture(10);
+    }
+  }, []);
+
+  // CAP: no projection beyond (firstActualYear + 30)
+  const maxEndYear = firstActualYear + 30;
+  const maxFutureYears = Math.max(0, maxEndYear - CURRENT_YEAR);
+  const clampedYearsFuture = Math.min(Math.max(yearsFuture, 1), maxFutureYears);
+
   // series
-  const actualSeries=useMemo(()=>makeActualSeries(totalForDonut,60),[totalForDonut]);
+  const actualSeries=useMemo(()=>makeActualSeries(totalForDonut, monthsBackActual),[totalForDonut]);
   const lastActual=actualSeries[actualSeries.length-1]?.value??totalForDonut;
-  const projected=useMemo(()=>projectFrom(lastActual,10,annualPct/100,monthly),[lastActual,monthly,annualPct]);
+  const projected=useMemo(
+    ()=>projectFrom(lastActual, clampedYearsFuture, annualPct/100, monthly),
+    [lastActual, monthly, annualPct, clampedYearsFuture]
+  );
 
   const alloc={ TFSA: totalForDonut*0.66, RRSP: totalForDonut*0.34, LIRA: 0, MARGIN: 0, OTHER: 0, overall: totalForDonut };
 
@@ -337,16 +404,60 @@ export default function Home() {
   const rrspPercent=useMemo(()=>{ const dep=brokerage?.rrspDepositedThisYear??0; return rrspRoom>0?clamp((dep/rrspRoom)*100,0,100):0; },[brokerage?.rrspDepositedThisYear,rrspRoom]);
   const DONUT_W=144, DONUT_H=112;
 
+  // Buttons
+  const canAddYears = clampedYearsFuture < maxFutureYears;
+  const canMinusYears = clampedYearsFuture > 1;
+
+  const onAddFiveYears = () => setYearsFuture(prev => Math.min(prev + 5, maxFutureYears));
+  const onMinusFiveYears = () => setYearsFuture(prev => Math.max(prev - 5, 1));
+  const onResetTen = () => setYearsFuture(10);
+
   return (
     <main className="max-w-6xl mx-auto p-3 sm:p-4 grid grid-cols-1 lg:grid-cols-3 gap-3 sm:gap-4">
+      {sliderCss}
+
       <div className="lg:col-span-2 space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+          <div className="text-sm text-gray-600">
+            First actual year: <span className="font-medium">{firstActualYear}</span> ·
+            &nbsp;Projection limit: <span className="font-medium">{maxEndYear}</span> ·
+            &nbsp;Showing: <span className="font-medium">{clampedYearsFuture}y</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={onMinusFiveYears}
+              disabled={!canMinusYears}
+              className="rounded-lg bg-gray-200 text-gray-900 px-3 py-1.5 text-sm disabled:opacity-40"
+              title="Reduce projection by 5 years"
+            >
+              – 5 years
+            </button>
+            <button
+              onClick={onAddFiveYears}
+              disabled={!canAddYears}
+              className="rounded-lg bg-gray-900 text-white px-3 py-1.5 text-sm disabled:opacity-40"
+              title={`Extend projection by 5 years (max ${maxEndYear})`}
+            >
+              + 5 years
+            </button>
+            <button
+              onClick={onResetTen}
+              className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm"
+              title="Reset to 10 years"
+            >
+              Reset to 10y
+            </button>
+          </div>
+        </div>
+
         <ProjectionChart
           actual={actualSeries}
           projected={projected}
-          years={10}
+          years={clampedYearsFuture}
           annualPct={annualPct}
         />
 
+        {/* Monthly contribution (thin slider) */}
         <div className="rounded-2xl border p-4 shadow-sm bg-white">
           <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
             <label className="text-sm font-medium">Monthly Contribution</label>
@@ -359,13 +470,13 @@ export default function Home() {
             step={100}
             value={monthly}
             onChange={(e)=>setMonthly(Math.round(+e.target.value/100)*100)}
-            className="w-full mt-2"
+            className="thin mt-2"
             aria-label="Monthly contribution slider"
           />
           <div className="flex justify-between text-xs text-gray-400"><span>$0</span><span>$10,000</span></div>
         </div>
 
-        {/* 0–100% annual return */}
+        {/* Annual return (thin slider) */}
         <div className="rounded-2xl border p-4 shadow-sm bg-white">
           <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
             <label className="text-sm font-medium">Assumed Annual Return</label>
@@ -378,12 +489,13 @@ export default function Home() {
             step={0.5}
             value={annualPct}
             onChange={(e)=>setAnnualPct(Math.max(0, Math.min(100, +e.target.value)))}
-            className="w-full mt-2"
+            className="thin mt-2"
             aria-label="Annual return slider"
           />
           <div className="flex justify-between text-xs text-gray-400"><span>0%</span><span>100%</span></div>
         </div>
 
+        {/* Contribution room */}
         <div className="rounded-2xl border p-4 shadow-sm bg-white">
           <div className="text-sm font-medium mb-3">Contribution Room — {CURRENT_YEAR}</div>
           <div className="space-y-8">
