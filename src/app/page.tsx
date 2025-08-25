@@ -520,7 +520,6 @@ export default function Home() {
     <main className="min-h-screen bg-gray-50">
       <header className="border-b bg-white">
         <div className="max-w-6xl mx-auto p-4 flex items-center justify-between">
-          <h1 className="text-xl font-semibold">Compoundly</h1>
         </div>
       </header>
 
