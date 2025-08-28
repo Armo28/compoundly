@@ -1,49 +1,48 @@
-import { NextRequest } from 'next/server';
-import { routeClient } from '@/lib/supabaseRoute';
+import { NextRequest, NextResponse } from 'next/server';
+import { getRouteClient, requireUser } from '@/lib/supabaseRoute';
 
-export async function GET() {
-  const supa = routeClient();
-  const { data: { user }, error: uErr } = await supa.auth.getUser();
-  if (uErr || !user) return new Response('Unauthorized', { status: 401 });
+/**
+ * Table: children(user_id uuid, name text, birth_year int, created_at timestamptz default now())
+ * RLS: user_id = auth.uid()
+ */
 
-  const { data, error } = await supa
-    .from('children')
-    .select('*')
-    .eq('user_id', user.id)
-    .order('birth_year');
-
-  if (error) return new Response(error.message, { status: 500 });
-  return Response.json(data);
+export async function GET(req: NextRequest) {
+  try {
+    const user = await requireUser(req);
+    const { supabase } = getRouteClient(req);
+    const { data, error } = await supabase
+      .from('children')
+      .select('id,name,birth_year,created_at')
+      .eq('user_id', user.id)
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+    return NextResponse.json({ ok: true, children: data ?? [] });
+  } catch (e: any) {
+    const status = e?.status ?? 500;
+    return NextResponse.json({ ok: false, error: e?.message ?? 'Server error' }, { status });
+  }
 }
 
 export async function POST(req: NextRequest) {
-  const supa = routeClient();
-  const { data: { user }, error: uErr } = await supa.auth.getUser();
-  if (uErr || !user) return new Response('Unauthorized', { status: 401 });
+  try {
+    const user = await requireUser(req);
+    const body = await req.json();
+    const name = `${body?.name ?? ''}`.trim();
+    const birth_year = Number(body?.birth_year ?? 0);
+    if (!name || !birth_year) {
+      return NextResponse.json({ ok: false, error: 'Invalid payload' }, { status: 400 });
+    }
+    const { supabase } = getRouteClient(req);
+    const { data, error } = await supabase
+      .from('children')
+      .insert([{ user_id: user.id, name, birth_year }])
+      .select('id,name,birth_year,created_at')
+      .single();
 
-  const body = await req.json();
-  const { name, birth_year } = body || {};
-  if (!birth_year) return new Response('Missing birth_year', { status: 400 });
-
-  const { data, error } = await supa
-    .from('children')
-    .insert({ user_id: user.id, name: name ?? null, birth_year: Number(birth_year) })
-    .select('*')
-    .single();
-
-  if (error) return new Response(error.message, { status: 500 });
-  return Response.json(data);
-}
-
-export async function DELETE(req: NextRequest) {
-  const supa = routeClient();
-  const { data: { user }, error: uErr } = await supa.auth.getUser();
-  if (uErr || !user) return new Response('Unauthorized', { status: 401 });
-
-  const id = new URL(req.url).searchParams.get('id');
-  if (!id) return new Response('Missing id', { status: 400 });
-
-  const { error } = await supa.from('children').delete().eq('id', id).eq('user_id', user.id);
-  if (error) return new Response(error.message, { status: 500 });
-  return new Response(null, { status: 204 });
+    if (error) throw error;
+    return NextResponse.json({ ok: true, child: data });
+  } catch (e: any) {
+    const status = e?.status ?? 500;
+    return NextResponse.json({ ok: false, error: e?.message ?? 'Server error' }, { status });
+  }
 }

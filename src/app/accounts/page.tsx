@@ -1,110 +1,105 @@
 'use client';
 import { useEffect, useState } from 'react';
+import { useAuth } from '@/lib/auth';
 
-type Account = {
-  id: string;
-  name: string | null;
-  institution: string | null;
-  type: string;
-  balance: number;
-};
-
-const TYPES = ['TFSA', 'RRSP', 'RESP', 'Margin', 'Other'];
+type Account = { id: string; name: string; type: string; balance: number };
+const types = ['TFSA','RRSP','RESP','Margin','Other'] as const;
 
 export default function AccountsPage() {
-  const [rows, setRows] = useState<Account[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [form, setForm] = useState({ name: '', institution: '', type: 'TFSA', balance: '' });
+  const { session } = useAuth();
+  const token = session?.access_token ?? null;
+
+  const [list, setList] = useState<Account[]>([]);
+  const [name, setName] = useState('');
+  const [type, setType] = useState<(typeof types)[number]>('TFSA');
+  const [balance, setBalance] = useState<number>(0);
+  const [err, setErr] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
 
   async function load() {
     setLoading(true);
-    const res = await fetch('/api/accounts', { cache: 'no-store' });
-    setLoading(false);
-    if (res.ok) setRows(await res.json());
-  }
-  useEffect(() => { load(); }, []);
-
-  async function add(e: React.FormEvent) {
-    e.preventDefault();
-    const body = { ...form, balance: Number(form.balance || 0) };
-    const res = await fetch('/api/accounts', { method: 'POST', body: JSON.stringify(body) });
-    if (res.ok) {
-      setForm({ name: '', institution: '', type: 'TFSA', balance: '' });
-      load();
-    } else {
-      alert(await res.text());
+    setErr(null);
+    try {
+      const res = await fetch('/api/accounts', {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      const json = await res.json();
+      if (!json.ok) throw new Error(json.error || 'Failed');
+      setList(json.accounts || []);
+    } catch (e:any) {
+      setErr(e?.message ?? 'Error');
+    } finally {
+      setLoading(false);
     }
   }
 
-  async function remove(id: string) {
-    const res = await fetch(`/api/accounts?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
-    if (res.status === 204) load();
+  useEffect(() => { if (token) load(); }, [token]);
+
+  async function add() {
+    setErr(null);
+    try {
+      const res = await fetch('/api/accounts', {
+        method: 'POST',
+        headers: {
+          'Content-Type':'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ name, type, balance }),
+      });
+      const json = await res.json();
+      if (!json.ok) throw new Error(json.error || 'Failed');
+      setName(''); setType('TFSA'); setBalance(0);
+      load();
+    } catch (e:any) {
+      setErr(e?.message ?? 'Error');
+    }
   }
 
   return (
-    <main className="max-w-6xl mx-auto p-4 space-y-4">
-      <div className="rounded-2xl border bg-white p-5 shadow-sm dark:bg-neutral-900 dark:border-neutral-800">
-        <h1 className="text-xl font-semibold">Your accounts (manual)</h1>
-        <p className="mt-1 text-sm text-gray-600 dark:text-gray-300">
-          Add any account from any institution. You can connect brokerages later; manual is always available.
-        </p>
+    <main className="max-w-3xl mx-auto p-4">
+      <h1 className="text-xl font-semibold mb-4">Accounts</h1>
+
+      {!token && (
+        <div className="rounded-lg border bg-yellow-50 text-yellow-900 p-3 mb-4">
+          Sign in to manage accounts.
+        </div>
+      )}
+
+      <div className="rounded-xl border bg-white p-4 mb-4">
+        <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+          <input className="border rounded-lg px-3 py-2" placeholder="Name"
+                 value={name} onChange={e=>setName(e.target.value)} />
+          <select className="border rounded-lg px-3 py-2" value={type} onChange={e=>setType(e.target.value as any)}>
+            {types.map(t=> <option key={t} value={t}>{t}</option>)}
+          </select>
+          <input className="border rounded-lg px-3 py-2" type="number" placeholder="Balance"
+                 value={balance} onChange={e=>setBalance(Number(e.target.value||0))} />
+          <button onClick={add} disabled={!token}
+            className="rounded-lg bg-blue-600 text-white px-3 py-2 disabled:opacity-50">
+            Add
+          </button>
+        </div>
+        {err && <p className="text-sm text-red-600 mt-2">{err}</p>}
       </div>
 
-      <form onSubmit={add} className="rounded-2xl border bg-white p-4 shadow-sm grid grid-cols-1 md:grid-cols-5 gap-3 dark:bg-neutral-900 dark:border-neutral-800">
-        <input
-          placeholder="Name (optional)"
-          className="rounded-lg border px-3 py-2 dark:bg-neutral-900 dark:border-neutral-700"
-          value={form.name} onChange={e=>setForm(s=>({...s, name:e.target.value}))}
-        />
-        <input
-          placeholder="Institution (optional)"
-          className="rounded-lg border px-3 py-2 dark:bg-neutral-900 dark:border-neutral-700"
-          value={form.institution} onChange={e=>setForm(s=>({...s, institution:e.target.value}))}
-        />
-        <select
-          className="rounded-lg border px-3 py-2 dark:bg-neutral-900 dark:border-neutral-700"
-          value={form.type} onChange={e=>setForm(s=>({...s, type:e.target.value}))}
-        >
-          {TYPES.map(t=><option key={t}>{t}</option>)}
-        </select>
-        <input
-          placeholder="Balance (CAD)"
-          type="number" min="0" step="0.01"
-          className="rounded-lg border px-3 py-2 dark:bg-neutral-900 dark:border-neutral-700"
-          value={form.balance} onChange={e=>setForm(s=>({...s, balance:e.target.value}))}
-        />
-        <button className="rounded-lg bg-indigo-600 text-white px-4 py-2">Add account</button>
-      </form>
-
-      <div className="rounded-2xl border bg-white p-0 overflow-hidden shadow-sm dark:bg-neutral-900 dark:border-neutral-800">
-        <table className="w-full text-sm">
-          <thead className="bg-gray-50 dark:bg-neutral-800">
-            <tr className="text-left">
-              <th className="px-4 py-2">Name</th>
-              <th className="px-4 py-2">Institution</th>
-              <th className="px-4 py-2">Type</th>
-              <th className="px-4 py-2">Balance</th>
-              <th className="px-4 py-2 w-20"></th>
-            </tr>
-          </thead>
-          <tbody>
-            {loading ? (
-              <tr><td className="px-4 py-3" colSpan={5}>Loading…</td></tr>
-            ) : rows.length === 0 ? (
-              <tr><td className="px-4 py-3" colSpan={5}>No accounts yet.</td></tr>
-            ) : rows.map(r=>(
-              <tr key={r.id} className="border-t dark:border-neutral-800">
-                <td className="px-4 py-2">{r.name || '—'}</td>
-                <td className="px-4 py-2">{r.institution || '—'}</td>
-                <td className="px-4 py-2">{r.type}</td>
-                <td className="px-4 py-2">CA${Number(r.balance||0).toLocaleString()}</td>
-                <td className="px-4 py-2">
-                  <button onClick={()=>remove(r.id)} className="rounded-md border px-2 py-1 dark:border-neutral-700">Delete</button>
-                </td>
-              </tr>
+      <div className="rounded-xl border bg-white">
+        <div className="p-3 border-b text-sm text-gray-600">Your Accounts</div>
+        {loading ? (
+          <div className="p-4 text-sm">Loading…</div>
+        ) : list.length === 0 ? (
+          <div className="p-4 text-sm text-gray-500">No accounts yet.</div>
+        ) : (
+          <ul className="divide-y">
+            {list.map(a=>(
+              <li key={a.id} className="p-3 flex items-center justify-between">
+                <div>
+                  <div className="font-medium">{a.name} <span className="text-gray-500">({a.type})</span></div>
+                </div>
+                <div className="tabular-nums">${a.balance.toLocaleString()}</div>
+              </li>
             ))}
-          </tbody>
-        </table>
+          </ul>
+        )}
       </div>
     </main>
   );
