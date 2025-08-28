@@ -21,7 +21,7 @@ export default function Header() {
         <div className="flex items-center justify-between">
           <Link href="/" className="text-xl font-semibold">Compoundly</Link>
 
-          <div className="hidden md:flex items-center gap-4">
+          <nav className="hidden md:flex items-center gap-4">
             {tabs.map(t => (
               <Link
                 key={t.href}
@@ -33,7 +33,7 @@ export default function Header() {
                 {t.label}
               </Link>
             ))}
-          </div>
+          </nav>
 
           <div className="flex items-center gap-3 text-sm">
             {user ? (
@@ -52,7 +52,7 @@ export default function Header() {
           </div>
         </div>
 
-        <div className="md:hidden mt-2 flex items-center gap-2 overflow-x-auto">
+        <nav className="md:hidden mt-2 flex items-center gap-2 overflow-x-auto">
           {tabs.map(t => (
             <Link
               key={t.href}
@@ -64,7 +64,7 @@ export default function Header() {
               {t.label}
             </Link>
           ))}
-        </div>
+        </nav>
       </div>
     </header>
   );
