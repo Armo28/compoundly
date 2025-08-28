@@ -1,12 +1,10 @@
 import { NextRequest } from 'next/server';
-import { adminClient } from '@/lib/supabaseServer';
+import { routeClient } from '@/lib/supabaseRoute';
 
-// GET: list accounts for current user
-// POST: create account {name?, institution?, type, balance}
-export async function GET(req: NextRequest) {
-  const supa = adminClient();
-  const { data: { user } } = await supa.auth.getUser(); // relies on Supabase Auth cookies in prod
-  if (!user) return new Response('Unauthorized', { status: 401 });
+export async function GET() {
+  const supa = routeClient();
+  const { data: { user }, error: uErr } = await supa.auth.getUser();
+  if (uErr || !user) return new Response('Unauthorized', { status: 401 });
 
   const { data, error } = await supa
     .from('accounts')
@@ -19,9 +17,9 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
-  const supa = adminClient();
-  const { data: { user } } = await supa.auth.getUser();
-  if (!user) return new Response('Unauthorized', { status: 401 });
+  const supa = routeClient();
+  const { data: { user }, error: uErr } = await supa.auth.getUser();
+  if (uErr || !user) return new Response('Unauthorized', { status: 401 });
 
   const body = await req.json();
   const { name, institution, type, balance } = body || {};
@@ -29,7 +27,13 @@ export async function POST(req: NextRequest) {
 
   const { data, error } = await supa
     .from('accounts')
-    .insert({ user_id: user.id, name, institution, type, balance: Number(balance) || 0 })
+    .insert({
+      user_id: user.id,
+      name: name ?? null,
+      institution: institution ?? null,
+      type,
+      balance: Number(balance) || 0
+    })
     .select('*')
     .single();
 
@@ -38,12 +42,11 @@ export async function POST(req: NextRequest) {
 }
 
 export async function DELETE(req: NextRequest) {
-  const supa = adminClient();
-  const { data: { user } } = await supa.auth.getUser();
-  if (!user) return new Response('Unauthorized', { status: 401 });
+  const supa = routeClient();
+  const { data: { user }, error: uErr } = await supa.auth.getUser();
+  if (uErr || !user) return new Response('Unauthorized', { status: 401 });
 
-  const { searchParams } = new URL(req.url);
-  const id = searchParams.get('id');
+  const id = new URL(req.url).searchParams.get('id');
   if (!id) return new Response('Missing id', { status: 400 });
 
   const { error } = await supa.from('accounts').delete().eq('id', id).eq('user_id', user.id);
