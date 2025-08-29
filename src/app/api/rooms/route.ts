@@ -1,10 +1,6 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { getRouteClient, requireUser } from '@/lib/supabaseRoute';
-
-/**
- * Table: contribution_rooms(user_id uuid, year int, tfsa numeric, rrsp numeric, updated_at timestamptz default now())
- * RLS: user_id = auth.uid()
- */
+// src/app/api/rooms/route.ts
+import { NextRequest } from 'next/server';
+import { getRouteClient, jsonErr, jsonOK, requireUser } from '@/lib/supabaseRoute';
 
 export async function GET(req: NextRequest) {
   try {
@@ -13,16 +9,14 @@ export async function GET(req: NextRequest) {
     const year = new Date().getFullYear();
     const { data, error } = await supabase
       .from('contribution_rooms')
-      .select('year, tfsa, rrsp')
+      .select('year,tfsa,rrsp')
       .eq('user_id', user.id)
       .eq('year', year)
-      .maybeSingle();
-
-    if (error) throw error;
-    return NextResponse.json({ ok: true, room: data ?? { year, tfsa: 0, rrsp: 0 } });
+      .single();
+    if (error && error.code !== 'PGRST116') throw error; // not found is ok
+    return jsonOK({ ok: true, room: data ?? { year, tfsa: 0, rrsp: 0 } });
   } catch (e: any) {
-    const status = e?.status ?? 500;
-    return NextResponse.json({ ok: false, error: e?.message ?? 'Server error' }, { status });
+    return jsonErr(e?.message ?? 'Server error', e?.status ?? 500);
   }
 }
 
@@ -33,6 +27,7 @@ export async function POST(req: NextRequest) {
     const year = new Date().getFullYear();
     const tfsa = Number(body?.tfsa ?? 0);
     const rrsp = Number(body?.rrsp ?? 0);
+    if (Number.isNaN(tfsa) || Number.isNaN(rrsp)) return jsonErr('Invalid numbers');
 
     const { supabase } = getRouteClient(req);
     const { data, error } = await supabase
@@ -41,13 +36,11 @@ export async function POST(req: NextRequest) {
         [{ user_id: user.id, year, tfsa, rrsp, updated_at: new Date().toISOString() }],
         { onConflict: 'user_id,year' }
       )
-      .select('year, tfsa, rrsp')
+      .select('year,tfsa,rrsp')
       .single();
-
     if (error) throw error;
-    return NextResponse.json({ ok: true, room: data });
+    return jsonOK({ ok: true, room: data });
   } catch (e: any) {
-    const status = e?.status ?? 500;
-    return NextResponse.json({ ok: false, error: e?.message ?? 'Server error' }, { status });
+    return jsonErr(e?.message ?? 'Server error', e?.status ?? 500);
   }
 }
