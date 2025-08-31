@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useAuth } from '@/lib/auth';
 
 const CAD = (n:number)=>n.toLocaleString(undefined,{style:'currency',currency:'CAD',maximumFractionDigits:0});
@@ -8,8 +8,13 @@ const compact=(n:number)=>{
   try{return new Intl.NumberFormat(undefined,{style:'currency',currency:'CAD',notation:'compact',maximumFractionDigits:1}).format(n);}catch{return CAD(n);}
 };
 
-type HistoryPt={taken_on:string,total:number};
-type Summary={byType:Record<string,number>,overall:number,history:HistoryPt[]};
+type HistoryPt={ taken_on?: string; ts?: string; total: number }; // supports either column name
+type Summary={
+  byType: Record<string, number>;
+  total: number;           // new from API
+  overall?: number;        // legacy
+  history: HistoryPt[];
+};
 
 function Donut({ parts, total }:{parts:{key:string,val:number,color:string}[], total:number}) {
   const size=220, cx=size/2, cy=size/2, rO=90, rI=58;
@@ -71,26 +76,30 @@ function Chart({
     return `${line(pts)} L ${sx(last.m)} ${sy(0)} L ${sx(first.m)} ${sy(0)} Z`;
   };
 
-  // ticks
+  // y ticks (5 grid lines)
   const ticksY=5;
   const yTicks=new Array(ticksY+1).fill(0).map((_,i)=>minY+(i*(maxY-minY))/ticksY);
-  const futureYears=yearsFuture;
-  const showMonthly = futureYears<=10;
-  const months = Math.ceil(maxX/12)-Math.floor(minX/12);
-  const xTicks:number[]=[];
+
+  // x ticks: months if <= 24 months, otherwise years with dynamic step so labels never collide
+  const showMonthly = yearsFuture <= 2;
+  const xTicks:number[] = [];
   if (showMonthly) {
-    const stepM=1; // month tick
-    for(let m=Math.ceil(minX); m<=Math.floor(maxX); m+=stepM) xTicks.push(m);
+    // one label per month
+    for(let m=Math.ceil(minX); m<=Math.floor(maxX); m+=1) xTicks.push(m);
   } else {
-    const startY=Math.ceil(minX/12), endY=Math.floor(maxX/12);
-    for(let y=startY; y<=endY; y++) xTicks.push(y*12);
+    const totalYears = Math.ceil(maxX/12) - Math.floor(minX/12);
+    const stepYears = Math.max(1, Math.ceil(totalYears / 6)); // ~6 labels max
+    const startY = Math.ceil(minX/12);
+    const endY   = Math.floor(maxX/12);
+    for (let y=startY; y<=endY; y+=stepYears) xTicks.push(y*12);
   }
 
-  // controls
-  const dec = futureYears>10 ? 5 : 1;
-  const minusLabel = futureYears>10 ? '-5' : '-1';
-  const onMinus=()=>onSetYearsFuture(Math.max(1, futureYears-dec));
-  const onPlus =()=>onSetYearsFuture(Math.min(40, futureYears+5));
+  const dec = yearsFuture>10 ? 5 : 1;
+  const minusLabel = yearsFuture>10 ? '-5' : '-1';
+  const onMinus=()=>onSetYearsFuture(Math.max(1, yearsFuture-dec));
+  const onPlus =()=>onSetYearsFuture(Math.min(40, yearsFuture+5));
+
+  const now = new Date();
 
   return (
     <div className="rounded-2xl border bg-white p-4 shadow-sm">
@@ -121,23 +130,22 @@ function Chart({
           </g>
         ))}
 
-        {/* x ticks */}
+        {/* x ticks + labels */}
         {xTicks.map((m,i)=>(
           <g key={`x-${i}`}>
             <line x1={sx(m)} y1={h-padB} x2={sx(m)} y2={h-padB+6} stroke="#d1d5db"/>
             <text x={sx(m)} y={h-padB+18} fontSize="10" textAnchor="middle" fill="#6b7280">
-              {showMonthly ? new Date(new Date().getFullYear(), new Date().getMonth()+m).toLocaleString(undefined,{month:'short'}) :
-                (new Date().getFullYear() + Math.round(m/12))}
+              {showMonthly
+                ? new Date(now.getFullYear(), now.getMonth()+m).toLocaleString(undefined,{month:'short'})
+                : (now.getFullYear() + Math.round(m/12))
+              }
             </text>
           </g>
         ))}
 
         {/* fills + lines */}
-        {/* Actual area */}
         <path d={area(actual)} fill="#11182714" />
         <path d={line(actual)} fill="none" stroke="#111827" strokeWidth={2.5} />
-
-        {/* Projection gradient */}
         <defs>
           <linearGradient id="projFill" x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor="#22c55e" stopOpacity="0.25"/>
@@ -158,15 +166,12 @@ function Chart({
 
 export default function Dashboard() {
   const { session, loading } = useAuth();
+  const token = session?.access_token ?? '';
 
   const [summary,setSummary]=useState<Summary|null>(null);
-
-  // controls
   const [monthly,setMonthly]=useState<number>(1000);
-  const [rate,setRate]=useState<number>(10); // %
+  const [rate,setRate]=useState<number>(10);
   const [yearsFuture,setYearsFuture]=useState<number>(10);
-
-  const token = session?.access_token ?? '';
 
   useEffect(()=>{
     if(!token) return;
@@ -177,21 +182,27 @@ export default function Dashboard() {
     })();
   },[token]);
 
-  // Actual series from snapshots (m = months from now)
+  // actual series from snapshots; fallback to “today”
   const actual = useMemo(()=>{
-    if(!summary?.history?.length){ return [{m:0,v:summary?.overall??0}]; }
+    if(!summary) return [{m:0,v:0}];
+    if(!summary.history?.length){
+      const base = summary.total ?? Object.values(summary.byType||{}).reduce((a,b)=>a+b,0);
+      return [{m:0,v:base}];
+    }
     const pts = summary.history.map(h=>{
-      const d = new Date(h.taken_on);
+      const d = h.taken_on ? new Date(h.taken_on) : (h.ts ? new Date(h.ts) : new Date());
       const now = new Date();
       const months = (d.getFullYear()-now.getFullYear())*12 + (d.getMonth()-now.getMonth());
       return { m: months, v: Number(h.total||0) };
     }).filter(p=>p.m<=0);
-    // ensure last point at m=0 (today)
-    if (pts.length===0 || pts[pts.length-1].m<0) pts.push({m:0,v:summary?.overall??0});
+    if (pts.length===0 || pts[pts.length-1].m<0) {
+      const base = summary.total ?? Object.values(summary.byType||{}).reduce((a,b)=>a+b,0);
+      pts.push({m:0,v:base});
+    }
     return pts;
   },[summary]);
 
-  // Projection starting at today
+  // projection from today
   const proj = useMemo(()=>{
     const start = actual[actual.length-1]?.v ?? 0;
     const months = yearsFuture*12;
@@ -208,8 +219,11 @@ export default function Dashboard() {
   const parts = useMemo(()=>{
     const bt = summary?.byType ?? {};
     const palette:Record<string,string>={TFSA:'#34d399',RRSP:'#60a5fa',RESP:'#fbbf24',Margin:'#f472b6',Other:'#a78bfa',LIRA:'#f59e0b'};
-    const keys = Object.keys(bt);
-    return keys.map(k=>({key:k,val:bt[k],color:palette[k] ?? '#9ca3af'}));
+    return Object.keys(bt).map(k=>({key:k,val:bt[k]||0,color:palette[k] ?? '#9ca3af'}));
+  },[summary]);
+
+  const donutTotal = useMemo(()=>{
+    return summary?.total ?? Object.values(summary?.byType ?? {}).reduce((a,b)=>a+b,0);
   },[summary]);
 
   if (loading) return <main className="max-w-6xl mx-auto p-4"><div className="rounded-xl border bg-white p-6">Loading…</div></main>;
@@ -238,7 +252,7 @@ export default function Dashboard() {
       </div>
 
       <div className="space-y-4">
-        <Donut parts={parts} total={summary?.overall ?? 0}/>
+        <Donut parts={parts} total={donutTotal}/>
       </div>
     </main>
   );
