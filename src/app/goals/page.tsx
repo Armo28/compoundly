@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useMemo } from 'react';
 import { useAuth } from '@/lib/auth';
 
 const CAD=(n:number)=>n.toLocaleString(undefined,{style:'currency',currency:'CAD',maximumFractionDigits:0});
@@ -16,8 +16,24 @@ export default function GoalsPage() {
   const [pledge,setPledge]=useState(1000);
   const [rooms,setRooms]=useState<Rooms>({tfsa:0, rrsp:0});
   const [children,setChildren]=useState<Child[]>([]);
+
+  // --- SAFE local history (init empty; hydrate on client)
   const [notes,setNotes]=useState<string>('');
-  const [history,setHistory]=useState<string[]>(()=>JSON.parse(localStorage.getItem('goal_notes_history')||'[]'));
+  const [history,setHistory]=useState<string[]>([]);
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      const saved = JSON.parse(localStorage.getItem('goal_notes_history') || '[]');
+      if (Array.isArray(saved)) setHistory(saved);
+    } catch {}
+  }, []);
+  const saveHistory = (items: string[]) => {
+    setHistory(items);
+    if (typeof window !== 'undefined') {
+      try { localStorage.setItem('goal_notes_history', JSON.stringify(items)); } catch {}
+    }
+  };
+  // ---
 
   useEffect(()=>{
     if (!token) return;
@@ -31,39 +47,36 @@ export default function GoalsPage() {
     })();
   },[token,year]);
 
-  // simple planner: RESP (if children) up to $2,500/child/year → TFSA room → RRSP room → margin
+  // simple planner: RESP (if kids) up to $2,500/child/year → TFSA room → RRSP room → margin
   const suggestion = useMemo(()=>{
     let remaining = pledge;
-    const monthsLeft = 12 - new Date().getMonth();
     const out = { RESP: 0, TFSA: 0, RRSP: 0, Margin: 0 };
 
     const kids = children.length;
     if (kids>0) {
-      const respCapYear = kids * 2500;                    // per calendar year
+      const respCapYear = kids * 2500;
       const respMonthlyMax = respCapYear / 12;
       const toResp = Math.min(remaining, respMonthlyMax);
-      out.RESP = toResp;
-      remaining -= toResp;
+      out.RESP = toResp; remaining -= toResp;
     }
 
     const tfsaMonthlyCap = rooms.tfsa / 12;
     const toTfsa = Math.min(remaining, Math.max(0, tfsaMonthlyCap));
-    out.TFSA = toTfsa;
-    remaining -= toTfsa;
+    out.TFSA = toTfsa; remaining -= toTfsa;
 
     const rrspMonthlyCap = rooms.rrsp / 12;
     const toRrsp = Math.min(remaining, Math.max(0, rrspMonthlyCap));
-    out.RRSP = toRrsp;
-    remaining -= toRrsp;
+    out.RRSP = toRrsp; remaining -= toRrsp;
 
     out.Margin = Math.max(0, remaining);
     return out;
   },[pledge, rooms, children]);
 
-  // voice-to-text (best-effort; works in Chrome/Safari)
+  // voice-to-text with guards
   const recRef = useRef<any>(null);
   const [listening,setListening]=useState(false);
   function toggleMic() {
+    if (typeof window === 'undefined') return;
     const SR:any = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SR) { alert('Voice input not supported on this browser.'); return; }
     if (listening && recRef.current) { recRef.current.stop(); setListening(false); return; }
@@ -76,8 +89,7 @@ export default function GoalsPage() {
   function commitNote() {
     if (!notes.trim()) return;
     const newHist = [notes.trim(), ...history].slice(0,50);
-    setHistory(newHist);
-    localStorage.setItem('goal_notes_history', JSON.stringify(newHist));
+    saveHistory(newHist);
     setNotes('');
   }
 
