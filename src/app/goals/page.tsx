@@ -1,138 +1,315 @@
 'use client';
 
-import { useEffect, useRef, useState, useMemo } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useAuth } from '@/lib/auth';
 
-const CAD=(n:number)=>n.toLocaleString(undefined,{style:'currency',currency:'CAD',maximumFractionDigits:0});
+// ---------- Minimal SpeechRecognition shim (no DOM type collisions) ----------
+declare global {
+  interface Window {
+    SpeechRecognition?: any;
+    webkitSpeechRecognition?: any;
+  }
+}
 
-type Rooms = { tfsa: number; rrsp: number };
+// ---------- Helpers ----------
+const CAD = (n: number) =>
+  n.toLocaleString(undefined, { style: 'currency', currency: 'CAD', maximumFractionDigits: 0 });
+
 type Child = { id: string; name: string; birth_year: number };
+type Rooms = { year: number; tfsa: number; rrsp: number } | null;
 
+type PastGoal = { id: string; ts: number; text: string };
+
+// LocalStorage helpers with SSR guards
+const loadGoals = (): PastGoal[] => {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = localStorage.getItem('compoundly.pastGoals');
+    return raw ? (JSON.parse(raw) as PastGoal[]) : [];
+  } catch {
+    return [];
+  }
+};
+const saveGoals = (goals: PastGoal[]) => {
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.setItem('compoundly.pastGoals', JSON.stringify(goals));
+  } catch {}
+};
+
+// ---------- Page ----------
 export default function GoalsPage() {
   const { session } = useAuth();
   const token = session?.access_token ?? '';
-  const year = new Date().getFullYear();
 
-  const [pledge,setPledge]=useState(1000);
-  const [rooms,setRooms]=useState<Rooms>({tfsa:0, rrsp:0});
-  const [children,setChildren]=useState<Child[]>([]);
+  // Mic / text
+  const [isListening, setIsListening] = useState(false);
+  const [liveText, setLiveText] = useState('');
+  const recRef = useRef<any | null>(null);
 
-  // --- SAFE local history (init empty; hydrate on client)
-  const [notes,setNotes]=useState<string>('');
-  const [history,setHistory]=useState<string[]>([]);
+  // Persisted goals
+  const [past, setPast] = useState<PastGoal[]>([]);
+
+  // Inputs
+  const [pledge, setPledge] = useState<number>(1800);
+
+  // Data fetched for planning
+  const [children, setChildren] = useState<Child[]>([]);
+  const [room, setRoom] = useState<Rooms>(null);
+
+  // ---------- Effects: load past goals from localStorage ----------
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-    try {
-      const saved = JSON.parse(localStorage.getItem('goal_notes_history') || '[]');
-      if (Array.isArray(saved)) setHistory(saved);
-    } catch {}
+    setPast(loadGoals());
   }, []);
-  const saveHistory = (items: string[]) => {
-    setHistory(items);
-    if (typeof window !== 'undefined') {
-      try { localStorage.setItem('goal_notes_history', JSON.stringify(items)); } catch {}
-    }
-  };
-  // ---
 
-  useEffect(()=>{
+  // ---------- Effects: fetch children & room ----------
+  useEffect(() => {
     if (!token) return;
-    (async()=>{
-      const r1 = await fetch(`/api/rooms?year=${year}`,{headers:{authorization:`Bearer ${token}`}});
-      const j1 = await r1.json();
-      if (j1?.ok) setRooms({tfsa: Number(j1.room?.tfsa||0), rrsp: Number(j1.room?.rrsp||0)});
-      const r2 = await fetch('/api/children',{headers:{authorization:`Bearer ${token}`}});
-      const j2 = await r2.json();
-      if (j2?.ok) setChildren(j2.children||[]);
+
+    (async () => {
+      try {
+        // Children
+        const cRes = await fetch('/api/children', {
+          headers: { authorization: `Bearer ${token}` },
+          cache: 'no-store',
+        });
+        const cJ = await cRes.json();
+        if (cJ?.ok && Array.isArray(cJ.children)) setChildren(cJ.children);
+
+        // Contribution room (current year)
+        const y = new Date().getFullYear();
+        const rRes = await fetch(`/api/rooms?year=${y}`, {
+          headers: { authorization: `Bearer ${token}` },
+          cache: 'no-store',
+        });
+        const rJ = await rRes.json();
+        if (rJ?.ok && rJ.room) setRoom(rJ.room);
+      } catch {
+        // ignore
+      }
     })();
-  },[token,year]);
+  }, [token]);
 
-  // simple planner: RESP (if kids) up to $2,500/child/year → TFSA room → RRSP room → margin
-  const suggestion = useMemo(()=>{
-    let remaining = pledge;
-    const out = { RESP: 0, TFSA: 0, RRSP: 0, Margin: 0 };
+  // ---------- Mic handlers ----------
+  const startListening = () => {
+    if (typeof window === 'undefined') return;
 
-    const kids = children.length;
-    if (kids>0) {
-      const respCapYear = kids * 2500;
-      const respMonthlyMax = respCapYear / 12;
-      const toResp = Math.min(remaining, respMonthlyMax);
-      out.RESP = toResp; remaining -= toResp;
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      alert('Speech recognition is not supported in this browser.');
+      return;
     }
 
-    const tfsaMonthlyCap = rooms.tfsa / 12;
-    const toTfsa = Math.min(remaining, Math.max(0, tfsaMonthlyCap));
-    out.TFSA = toTfsa; remaining -= toTfsa;
+    const rec = new SR();
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.lang = 'en-CA';
 
-    const rrspMonthlyCap = rooms.rrsp / 12;
-    const toRrsp = Math.min(remaining, Math.max(0, rrspMonthlyCap));
-    out.RRSP = toRrsp; remaining -= toRrsp;
+    rec.onresult = (ev: any) => {
+      // Aggregate interim + final transcripts live
+      let interim = '';
+      let final = '';
+      for (let i = ev.resultIndex; i < ev.results.length; i++) {
+        const res = ev.results[i];
+        const txt = res[0]?.transcript ?? '';
+        if (res.isFinal) final += txt + ' ';
+        else interim += txt + ' ';
+      }
+      setLiveText((prev) => (final ? (prev + ' ' + final).trim() : (prev + ' ' + interim).trim()));
+    };
+    rec.onerror = () => {
+      setIsListening(false);
+    };
+    rec.onend = () => {
+      setIsListening(false);
+    };
 
-    out.Margin = Math.max(0, remaining);
-    return out;
-  },[pledge, rooms, children]);
+    rec.start();
+    recRef.current = rec;
+    setIsListening(true);
+  };
 
-  // voice-to-text with guards
-  const recRef = useRef<any>(null);
-  const [listening,setListening]=useState(false);
-  function toggleMic() {
-    if (typeof window === 'undefined') return;
-    const SR:any = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SR) { alert('Voice input not supported on this browser.'); return; }
-    if (listening && recRef.current) { recRef.current.stop(); setListening(false); return; }
-    const rec = new SR(); rec.lang='en-US'; rec.interimResults=false;
-    rec.onresult = (e:any)=>{ const t = e.results[0][0].transcript; setNotes(prev=> (prev? (prev+'\n') : '') + t ); };
-    rec.onend = ()=>setListening(false);
-    recRef.current = rec; setListening(true); rec.start();
-  }
+  const stopListening = () => {
+    recRef.current?.stop?.();
+    recRef.current = null;
+    setIsListening(false);
+  };
 
-  function commitNote() {
-    if (!notes.trim()) return;
-    const newHist = [notes.trim(), ...history].slice(0,50);
-    saveHistory(newHist);
-    setNotes('');
-  }
+  // ---------- Save goal note ----------
+  const saveNote = () => {
+    const text = liveText.trim();
+    if (!text) return;
+    const entry: PastGoal = { id: crypto.randomUUID(), ts: Date.now(), text };
+    const next = [entry, ...past];
+    setPast(next);
+    saveGoals(next);
+    setLiveText('');
+  };
+
+  const deleteNote = (id: string) => {
+    const next = past.filter((p) => p.id !== id);
+    setPast(next);
+    saveGoals(next);
+  };
+
+  // ---------- Suggested split ----------
+  const split = useMemo(() => {
+    let remaining = Math.max(0, pledge);
+
+    // RESP first: $2,500/child/year → ~ per month
+    const kids = children.length;
+    const respYearlyMax = kids * 2500;
+    const respMonthlyMax = respYearlyMax / 12;
+    const toRESP = Math.min(respMonthlyMax, remaining);
+    remaining -= toRESP;
+
+    // TFSA next (cap monthly by room/12 if we have room data)
+    const tfsaMonthlyCap =
+      room ? Math.max(0, Number(room.tfsa || 0)) / 12 : Number.POSITIVE_INFINITY;
+    const toTFSA = Math.min(tfsaMonthlyCap, remaining);
+    remaining -= toTFSA;
+
+    // RRSP next (cap monthly by room/12 if we have room data)
+    const rrspMonthlyCap =
+      room ? Math.max(0, Number(room.rrsp || 0)) / 12 : Number.POSITIVE_INFINITY;
+    const toRRSP = Math.min(rrspMonthlyCap, remaining);
+    remaining -= toRRSP;
+
+    // Remainder to margin/other
+    const toMargin = Math.max(0, remaining);
+
+    return { toRESP, toTFSA, toRRSP, toMargin };
+  }, [pledge, children, room]);
+
+  // ---------- UI ----------
+  return (
+    <main className="max-w-4xl mx-auto p-4 space-y-4">
+      {/* Pledge → split */}
+      <section className="rounded-2xl border bg-white p-4 shadow-sm">
+        <div className="text-sm font-medium mb-3">Monthly pledge</div>
+        <div className="flex items-center gap-3">
+          <span className="w-28 text-right text-sm text-gray-600">{CAD(pledge)}</span>
+          <input
+            type="range"
+            min={0}
+            max={10000}
+            step={50}
+            className="w-full h-2 bg-gray-200 rounded-lg accent-blue-600"
+            value={pledge}
+            onChange={(e) => setPledge(Math.round(+e.target.value))}
+          />
+        </div>
+        <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-sm">
+          <div className="rounded-lg border p-3">
+            <div className="text-gray-600">RESP</div>
+            <div className="font-semibold">{CAD(split.toRESP)}</div>
+          </div>
+          <div className="rounded-lg border p-3">
+            <div className="text-gray-600">TFSA</div>
+            <div className="font-semibold">{CAD(split.toTFSA)}</div>
+          </div>
+          <div className="rounded-lg border p-3">
+            <div className="text-gray-600">RRSP</div>
+            <div className="font-semibold">{CAD(split.toRRSP)}</div>
+          </div>
+          <div className="rounded-lg border p-3">
+            <div className="text-gray-600">Margin/Other</div>
+            <div className="font-semibold">{CAD(split.toMargin)}</div>
+          </div>
+        </div>
+        <p className="mt-2 text-xs text-gray-500">
+          Priorities: RESP up to $2,500 per child per year → TFSA to available room →
+          RRSP to available room → remainder to Margin/Other.
+        </p>
+      </section>
+
+      {/* Voice-to-text + note saving */}
+      <section className="rounded-2xl border bg-white p-4 shadow-sm space-y-3">
+        <div className="text-sm font-medium">Describe your goals</div>
+        <div className="flex flex-wrap items-center gap-2">
+          {!isListening ? (
+            <button
+              onClick={startListening}
+              className="rounded-md bg-emerald-600 text-white text-sm px-4 py-1.5"
+            >
+              🎙️ Start mic
+            </button>
+          ) : (
+            <button
+              onClick={stopListening}
+              className="rounded-md bg-red-600 text-white text-sm px-4 py-1.5"
+            >
+              ⏹ Stop
+            </button>
+          )}
+          <button
+            onClick={saveNote}
+            disabled={!liveText.trim()}
+            className="rounded-md border text-sm px-4 py-1.5 disabled:opacity-50"
+          >
+            Save note
+          </button>
+        </div>
+        <textarea
+          value={liveText}
+          onChange={(e) => setLiveText(e.target.value)}
+          placeholder="Speak or type your goal here…"
+          className="w-full h-28 rounded-lg border px-3 py-2 text-sm"
+        />
+        <p className="text-xs text-gray-500">
+          Your microphone text appears live while you speak. Click “Save note” to keep a record
+          below. (Notes are stored in your browser for now.)
+        </p>
+      </section>
+
+      {/* Past goals (list + expand + delete) */}
+      <section className="rounded-2xl border bg-white p-4 shadow-sm">
+        <div className="text-sm font-medium mb-2">Past Goals</div>
+        {past.length === 0 ? (
+          <div className="text-sm text-gray-500">No saved goals yet.</div>
+        ) : (
+          <ul className="divide-y">
+            {past.map((g) => (
+              <PastGoalRow key={g.id} goal={g} onDelete={() => deleteNote(g.id)} />
+            ))}
+          </ul>
+        )}
+      </section>
+    </main>
+  );
+}
+
+// Row with disclosure
+function PastGoalRow({ goal, onDelete }: { goal: PastGoal; onDelete: () => void }) {
+  const [open, setOpen] = useState(false);
+  const date = new Date(goal.ts);
+  const title = date.toLocaleString(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
 
   return (
-    <main className="max-w-4xl mx-auto p-4 space-y-6">
-      <div className="rounded-xl border bg-white p-4 space-y-4">
-        <div className="text-sm font-medium">Monthly pledge</div>
-        <div className="flex items-center gap-3">
-          <span className="min-w-[80px] text-right">{CAD(pledge)}</span>
-          <input type="range" min={0} max={5000} step={50} value={pledge} onChange={e=>setPledge(+e.target.value)}
-                 className="w-full h-2 rounded-lg bg-gray-200 appearance-none accent-blue-600"/>
-        </div>
-
-        <div className="rounded-lg border p-3">
-          <div className="text-sm font-medium mb-2">Suggested monthly split</div>
-          <ul className="text-sm space-y-1">
-            <li>RESP: <span className="font-semibold">{CAD(suggestion.RESP)}</span></li>
-            <li>TFSA: <span className="font-semibold">{CAD(suggestion.TFSA)}</span></li>
-            <li>RRSP: <span className="font-semibold">{CAD(suggestion.RRSP)}</span></li>
-            <li>Margin/Other: <span className="font-semibold">{CAD(suggestion.Margin)}</span></li>
-          </ul>
-          <div className="text-xs text-gray-500 mt-2">
-            Priority: RESP (if kids) up to $2,500/child/year → TFSA to room → RRSP to room → Margin.
-          </div>
-        </div>
+    <li className="py-3">
+      <div className="flex items-center justify-between gap-3">
+        <button
+          onClick={() => setOpen((v) => !v)}
+          className="text-left flex-1 text-sm font-medium hover:underline"
+          title="Show details"
+        >
+          {title}
+        </button>
+        <button onClick={onDelete} className="text-xs text-red-600 hover:underline">
+          Delete
+        </button>
       </div>
-
-      <div className="rounded-xl border bg-white p-4 space-y-3">
-        <div className="text-sm font-medium">Tell us your goals (text or voice)</div>
-        <textarea className="w-full border rounded-lg px-3 py-2 min-h-[90px]" placeholder='e.g., "I have two kids (2 and 4). I want $1M by 60 and to fund their university."' value={notes} onChange={e=>setNotes(e.target.value)}/>
-        <div className="flex gap-3">
-          <button onClick={commitNote} className="rounded-lg bg-blue-600 text-white px-4 py-2">Save note</button>
-          <button onClick={toggleMic} className="rounded-lg border px-4 py-2">{listening?'Stop 🎙️':'Speak 🎤'}</button>
+      {open && (
+        <div className="mt-2 text-sm whitespace-pre-wrap text-gray-800 bg-gray-50 border rounded-md p-3">
+          {goal.text}
         </div>
-        {history.length>0 && (
-          <div className="mt-2">
-            <div className="text-sm font-medium mb-1">Previous goal notes (local to this browser)</div>
-            <ul className="text-sm list-disc pl-5 space-y-1">
-              {history.map((h,i)=><li key={i}>{h}</li>)}
-            </ul>
-          </div>
-        )}
-      </div>
-    </main>
+      )}
+    </li>
   );
 }
