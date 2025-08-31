@@ -3,274 +3,248 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useAuth } from '@/lib/auth';
 
-// ---------- Minimal SpeechRecognition shim (no DOM type collisions) ----------
+const CAD = (n:number)=>n.toLocaleString(undefined,{style:'currency',currency:'CAD',maximumFractionDigits:0});
+
+// Types for Web Speech
 declare global {
   interface Window {
-    SpeechRecognition?: any;
     webkitSpeechRecognition?: any;
+    SpeechRecognition?: any;
   }
 }
 
-// ---------- Helpers ----------
-const CAD = (n: number) =>
-  n.toLocaleString(undefined, { style: 'currency', currency: 'CAD', maximumFractionDigits: 0 });
+type Rooms = { tfsa:number; rrsp:number };
+type Progress = { tfsa_deposited:number; rrsp_deposited:number };
+type Summary = { byType: Record<string, number> }; // from /api/summary
 
-type Child = { id: string; name: string; birth_year: number };
-type Rooms = { year: number; tfsa: number; rrsp: number } | null;
-
-type PastGoal = { id: string; ts: number; text: string };
-
-// LocalStorage helpers with SSR guards
-const loadGoals = (): PastGoal[] => {
-  if (typeof window === 'undefined') return [];
-  try {
-    const raw = localStorage.getItem('compoundly.pastGoals');
-    return raw ? (JSON.parse(raw) as PastGoal[]) : [];
-  } catch {
-    return [];
-  }
-};
-const saveGoals = (goals: PastGoal[]) => {
-  if (typeof window === 'undefined') return;
-  try {
-    localStorage.setItem('compoundly.pastGoals', JSON.stringify(goals));
-  } catch {}
-};
-
-// ---------- Page ----------
 export default function GoalsPage() {
   const { session } = useAuth();
   const token = session?.access_token ?? '';
 
-  // Mic / text
-  const [isListening, setIsListening] = useState(false);
-  const [liveText, setLiveText] = useState('');
-  const recRef = useRef<any | null>(null);
+  // monthly pledge slider
+  const [pledge, setPledge] = useState<number>(1500);
 
-  // Persisted goals
-  const [past, setPast] = useState<PastGoal[]>([]);
+  // portfolio context
+  const [rooms, setRooms] = useState<Rooms>({ tfsa:0, rrsp:0 });
+  const [progress, setProgress] = useState<Progress>({ tfsa_deposited:0, rrsp_deposited:0 });
+  const [summary, setSummary] = useState<Summary|null>(null);
 
-  // Inputs
-  const [pledge, setPledge] = useState<number>(1800);
+  // mic / notes
+  const [note, setNote] = useState<string>('');
+  const [notes, setNotes] = useState<{id:string,ts:number,text:string}[]>([]);
+  const [micOn, setMicOn] = useState(false);
+  const recRef = useRef<any>(null);
+  const interimRef = useRef<string>('');       // live text shown
+  const lastFinalRef = useRef<string>('');     // prevent duplicates
 
-  // Data fetched for planning
-  const [children, setChildren] = useState<Child[]>([]);
-  const [room, setRoom] = useState<Rooms>(null);
-
-  // ---------- Effects: load past goals from localStorage ----------
-  useEffect(() => {
-    setPast(loadGoals());
-  }, []);
-
-  // ---------- Effects: fetch children & room ----------
-  useEffect(() => {
+  // load context
+  useEffect(()=>{
     if (!token) return;
+    (async ()=>{
+      const [r1, r2, r3] = await Promise.all([
+        fetch('/api/rooms', { headers:{ authorization:`Bearer ${token}` }}).then(r=>r.json()),
+        fetch('/api/rooms/progress', { headers:{ authorization:`Bearer ${token}` }}).then(r=>r.json()),
+        fetch('/api/summary', { headers:{ authorization:`Bearer ${token}` }}).then(r=>r.json()),
+      ]);
+      if (r1?.room) setRooms({ tfsa:Number(r1.room.tfsa||0), rrsp:Number(r1.room.rrsp||0) });
+      if (r2?.progress) setProgress({
+        tfsa_deposited:Number(r2.progress.tfsa_deposited||0),
+        rrsp_deposited:Number(r2.progress.rrsp_deposited||0),
+      });
+      if (r3?.ok) setSummary({ byType: r3.byType || {} });
 
-    (async () => {
-      try {
-        // Children
-        const cRes = await fetch('/api/children', {
-          headers: { authorization: `Bearer ${token}` },
-          cache: 'no-store',
-        });
-        const cJ = await cRes.json();
-        if (cJ?.ok && Array.isArray(cJ.children)) setChildren(cJ.children);
-
-        // Contribution room (current year)
-        const y = new Date().getFullYear();
-        const rRes = await fetch(`/api/rooms?year=${y}`, {
-          headers: { authorization: `Bearer ${token}` },
-          cache: 'no-store',
-        });
-        const rJ = await rRes.json();
-        if (rJ?.ok && rJ.room) setRoom(rJ.room);
-      } catch {
-        // ignore
+      // local notes
+      if (typeof window !== 'undefined') {
+        const raw = window.localStorage.getItem('goalNotes');
+        if (raw) {
+          try { setNotes(JSON.parse(raw)); } catch {}
+        }
       }
     })();
-  }, [token]);
+  },[token]);
 
-  // ---------- Mic handlers ----------
-  const startListening = () => {
-    if (typeof window === 'undefined') return;
+  // RESP availability: only show if you have RESP account; otherwise, if user mentions “child”, show a nudge link
+  const hasRESPAccount = !!summary?.byType?.RESP;
 
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) {
-      alert('Speech recognition is not supported in this browser.');
-      return;
+  // suggested split
+  const suggested = useMemo(()=>{
+    let rest = pledge;
+    let toRESP=0, toTFSA=0, toRRSP=0, toMargin=0;
+
+    // RESP first (only if the user actually has RESP account)
+    if (hasRESPAccount) {
+      // up to $2,500/year total cap
+      const cap = 2500;
+      const remaining = cap; // We could subtract deposited so far if you track RESP deposits; 0 for now
+      const perMonth = Math.ceil(remaining/12);
+      const amt = Math.max(0, Math.min(rest, perMonth));
+      toRESP += amt; rest -= amt;
     }
 
-    const rec = new SR();
-    rec.continuous = true;
-    rec.interimResults = true;
-    rec.lang = 'en-CA';
+    // TFSA next up to available room
+    const tfsaLeft = Math.max(0, rooms.tfsa - progress.tfsa_deposited);
+    if (tfsaLeft > 0 && rest > 0) {
+      const perMonth = Math.ceil(tfsaLeft / 12);
+      const amt = Math.min(rest, perMonth);
+      toTFSA += amt; rest -= amt;
+    }
 
-    rec.onresult = (ev: any) => {
-      // Aggregate interim + final transcripts live
+    // RRSP next
+    const rrspLeft = Math.max(0, rooms.rrsp - progress.rrsp_deposited);
+    if (rrspLeft > 0 && rest > 0) {
+      const perMonth = Math.ceil(rrspLeft / 12);
+      const amt = Math.min(rest, perMonth);
+      toRRSP += amt; rest -= amt;
+    }
+
+    // remainder -> margin
+    toMargin = Math.max(0, rest);
+
+    return { toRESP, toTFSA, toRRSP, toMargin };
+  }, [pledge, rooms, progress, hasRESPAccount]);
+
+  // mic controls with interim text (prevents duplicates)
+  const startMic = ()=>{
+    if (typeof window === 'undefined') return;
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      alert('Speech recognition not supported in this browser.');
+      return;
+    }
+    const rec = new SR();
+    rec.interimResults = true;
+    rec.continuous = true;
+    rec.maxAlternatives = 1;
+    rec.lang = 'en-US';
+
+    rec.onresult = (e:any)=>{
+      let finalChunk = '';
       let interim = '';
-      let final = '';
-      for (let i = ev.resultIndex; i < ev.results.length; i++) {
-        const res = ev.results[i];
+      for (let i=e.resultIndex; i<e.results.length; i++){
+        const res = e.results[i];
         const txt = res[0]?.transcript ?? '';
-        if (res.isFinal) final += txt + ' ';
-        else interim += txt + ' ';
+        if (res.isFinal) {
+          // avoid duplicate final segments
+          if (txt && txt !== lastFinalRef.current) {
+            finalChunk += (finalChunk ? ' ' : '') + txt;
+            lastFinalRef.current = txt;
+          }
+        } else {
+          interim += (interim ? ' ' : '') + txt;
+        }
       }
-      setLiveText((prev) => (final ? (prev + ' ' + final).trim() : (prev + ' ' + interim).trim()));
+      if (finalChunk) setNote(prev => (prev ? prev + ' ' : '') + finalChunk);
+      interimRef.current = interim;
+      // show interim live by forcing a state update via trailing space trick
+      setNote(prev => prev); // render
     };
-    rec.onerror = () => {
-      setIsListening(false);
-    };
-    rec.onend = () => {
-      setIsListening(false);
-    };
+
+    rec.onerror = ()=>{};
+    rec.onend = ()=> setMicOn(false);
 
     rec.start();
     recRef.current = rec;
-    setIsListening(true);
+    setMicOn(true);
   };
 
-  const stopListening = () => {
+  const stopMic = ()=>{
     recRef.current?.stop?.();
-    recRef.current = null;
-    setIsListening(false);
+    setMicOn(false);
+    interimRef.current = '';
   };
 
-  // ---------- Save goal note ----------
-  const saveNote = () => {
-    const text = liveText.trim();
+  const onSaveNote = ()=>{
+    const text = (note + (interimRef.current ? (' ' + interimRef.current) : '')).trim();
     if (!text) return;
-    const entry: PastGoal = { id: crypto.randomUUID(), ts: Date.now(), text };
-    const next = [entry, ...past];
-    setPast(next);
-    saveGoals(next);
-    setLiveText('');
+    const item = { id: String(Date.now()), ts: Date.now(), text };
+    const next = [item, ...notes];
+    setNotes(next);
+    setNote('');
+    interimRef.current = '';
+    lastFinalRef.current = '';
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem('goalNotes', JSON.stringify(next));
+    }
   };
 
-  const deleteNote = (id: string) => {
-    const next = past.filter((p) => p.id !== id);
-    setPast(next);
-    saveGoals(next);
+  const onDeleteNote = (id:string)=>{
+    const next = notes.filter(n=>n.id !== id);
+    setNotes(next);
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem('goalNotes', JSON.stringify(next));
+    }
   };
 
-  // ---------- Suggested split ----------
-  const split = useMemo(() => {
-    let remaining = Math.max(0, pledge);
+  const showsChildNudge = !hasRESPAccount && /\b(child|children|kid|kids|RESP)\b/i.test(note || notes[0]?.text || '');
 
-    // RESP first: $2,500/child/year → ~ per month
-    const kids = children.length;
-    const respYearlyMax = kids * 2500;
-    const respMonthlyMax = respYearlyMax / 12;
-    const toRESP = Math.min(respMonthlyMax, remaining);
-    remaining -= toRESP;
-
-    // TFSA next (cap monthly by room/12 if we have room data)
-    const tfsaMonthlyCap =
-      room ? Math.max(0, Number(room.tfsa || 0)) / 12 : Number.POSITIVE_INFINITY;
-    const toTFSA = Math.min(tfsaMonthlyCap, remaining);
-    remaining -= toTFSA;
-
-    // RRSP next (cap monthly by room/12 if we have room data)
-    const rrspMonthlyCap =
-      room ? Math.max(0, Number(room.rrsp || 0)) / 12 : Number.POSITIVE_INFINITY;
-    const toRRSP = Math.min(rrspMonthlyCap, remaining);
-    remaining -= toRRSP;
-
-    // Remainder to margin/other
-    const toMargin = Math.max(0, remaining);
-
-    return { toRESP, toTFSA, toRRSP, toMargin };
-  }, [pledge, children, room]);
-
-  // ---------- UI ----------
   return (
-    <main className="max-w-4xl mx-auto p-4 space-y-4">
-      {/* Pledge → split */}
-      <section className="rounded-2xl border bg-white p-4 shadow-sm">
+    <main className="max-w-5xl mx-auto p-4 space-y-6">
+
+      {/* Monthly pledge + split */}
+      <section className="rounded-2xl border bg-white p-4">
         <div className="text-sm font-medium mb-3">Monthly pledge</div>
-        <div className="flex items-center gap-3">
-          <span className="w-28 text-right text-sm text-gray-600">{CAD(pledge)}</span>
-          <input
-            type="range"
-            min={0}
-            max={10000}
-            step={50}
-            className="w-full h-2 bg-gray-200 rounded-lg accent-blue-600"
-            value={pledge}
-            onChange={(e) => setPledge(Math.round(+e.target.value))}
-          />
+        <input type="range" min={0} max={10000} step={50}
+               value={pledge} onChange={e=>setPledge(+e.target.value)} className="w-full"/>
+        <div className="mt-2 text-sm text-gray-700">{CAD(pledge)}</div>
+
+        <div className="mt-4 grid grid-cols-1 md:grid-cols-4 gap-3">
+          {hasRESPAccount && (
+            <KPI title="RESP" value={CAD(suggested.toRESP)}/>
+          )}
+          <KPI title="TFSA" value={CAD(suggested.toTFSA)}/>
+          <KPI title="RRSP" value={CAD(suggested.toRRSP)}/>
+          <KPI title="Margin/Other" value={CAD(suggested.toMargin)}/>
         </div>
-        <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-sm">
-          <div className="rounded-lg border p-3">
-            <div className="text-gray-600">RESP</div>
-            <div className="font-semibold">{CAD(split.toRESP)}</div>
-          </div>
-          <div className="rounded-lg border p-3">
-            <div className="text-gray-600">TFSA</div>
-            <div className="font-semibold">{CAD(split.toTFSA)}</div>
-          </div>
-          <div className="rounded-lg border p-3">
-            <div className="text-gray-600">RRSP</div>
-            <div className="font-semibold">{CAD(split.toRRSP)}</div>
-          </div>
-          <div className="rounded-lg border p-3">
-            <div className="text-gray-600">Margin/Other</div>
-            <div className="font-semibold">{CAD(split.toMargin)}</div>
-          </div>
+
+        <div className="mt-2 text-xs text-gray-600">
+          Priorities: RESP up to $2,500 per child per year → TFSA to available room → RRSP to available room → remainder to Margin/Other.
+          {showsChildNudge && (
+            <span className="ml-2">
+              Mentioned children but no RESP account yet. <a href="/accounts" className="underline">Add RESP</a>
+            </span>
+          )}
         </div>
-        <p className="mt-2 text-xs text-gray-500">
-          Priorities: RESP up to $2,500 per child per year → TFSA to available room →
-          RRSP to available room → remainder to Margin/Other.
-        </p>
       </section>
 
-      {/* Voice-to-text + note saving */}
-      <section className="rounded-2xl border bg-white p-4 shadow-sm space-y-3">
-        <div className="text-sm font-medium">Describe your goals</div>
-        <div className="flex flex-wrap items-center gap-2">
-          {!isListening ? (
-            <button
-              onClick={startListening}
-              className="rounded-md bg-emerald-600 text-white text-sm px-4 py-1.5"
-            >
-              🎙️ Start mic
-            </button>
+      {/* Describe your goals (mic) */}
+      <section className="rounded-2xl border bg-white p-4">
+        <div className="text-sm font-medium mb-3">Describe your goals</div>
+        <div className="flex gap-2 mb-2">
+          {!micOn ? (
+            <button onClick={startMic} className="rounded-lg bg-emerald-600 text-white px-3 py-2">Start mic</button>
           ) : (
-            <button
-              onClick={stopListening}
-              className="rounded-md bg-red-600 text-white text-sm px-4 py-1.5"
-            >
-              ⏹ Stop
-            </button>
+            <button onClick={stopMic} className="rounded-lg bg-rose-600 text-white px-3 py-2">Stop</button>
           )}
-          <button
-            onClick={saveNote}
-            disabled={!liveText.trim()}
-            className="rounded-md border text-sm px-4 py-1.5 disabled:opacity-50"
-          >
-            Save note
-          </button>
+          <button onClick={onSaveNote} className="rounded-lg border px-3 py-2">Save note</button>
         </div>
         <textarea
-          value={liveText}
-          onChange={(e) => setLiveText(e.target.value)}
-          placeholder="Speak or type your goal here…"
-          className="w-full h-28 rounded-lg border px-3 py-2 text-sm"
+          className="w-full min-h-[140px] border rounded-lg px-3 py-2"
+          placeholder="Speak or type your plan…"
+          value={note + (interimRef.current ? (' ' + interimRef.current) : '')}
+          onChange={e=>{ setNote(e.target.value); interimRef.current=''; }}
         />
-        <p className="text-xs text-gray-500">
-          Your microphone text appears live while you speak. Click “Save note” to keep a record
-          below. (Notes are stored in your browser for now.)
-        </p>
+        <div className="mt-1 text-xs text-gray-500">
+          Your microphone text appears live while you speak. Click “Save note” to keep a record below. (Notes are stored in your browser for now.)
+        </div>
       </section>
 
-      {/* Past goals (list + expand + delete) */}
-      <section className="rounded-2xl border bg-white p-4 shadow-sm">
-        <div className="text-sm font-medium mb-2">Past Goals</div>
-        {past.length === 0 ? (
+      {/* Past goals */}
+      <section className="rounded-2xl border bg-white p-4">
+        <div className="text-sm font-medium mb-3">Past Goals</div>
+        {notes.length === 0 ? (
           <div className="text-sm text-gray-500">No saved goals yet.</div>
         ) : (
           <ul className="divide-y">
-            {past.map((g) => (
-              <PastGoalRow key={g.id} goal={g} onDelete={() => deleteNote(g.id)} />
+            {notes.map(n=>(
+              <li key={n.id} className="py-3 flex items-center justify-between">
+                <details className="w-full mr-3">
+                  <summary className="cursor-pointer text-sm">
+                    {new Date(n.ts).toLocaleString()}
+                  </summary>
+                  <div className="mt-2 text-sm text-gray-700 whitespace-pre-wrap">{n.text}</div>
+                </details>
+                <button onClick={()=>onDeleteNote(n.id)} className="text-rose-600 text-sm">Delete</button>
+              </li>
             ))}
           </ul>
         )}
@@ -279,37 +253,11 @@ export default function GoalsPage() {
   );
 }
 
-// Row with disclosure
-function PastGoalRow({ goal, onDelete }: { goal: PastGoal; onDelete: () => void }) {
-  const [open, setOpen] = useState(false);
-  const date = new Date(goal.ts);
-  const title = date.toLocaleString(undefined, {
-    year: 'numeric',
-    month: 'short',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-  });
-
+function KPI({ title, value }:{title:string,value:string}) {
   return (
-    <li className="py-3">
-      <div className="flex items-center justify-between gap-3">
-        <button
-          onClick={() => setOpen((v) => !v)}
-          className="text-left flex-1 text-sm font-medium hover:underline"
-          title="Show details"
-        >
-          {title}
-        </button>
-        <button onClick={onDelete} className="text-xs text-red-600 hover:underline">
-          Delete
-        </button>
-      </div>
-      {open && (
-        <div className="mt-2 text-sm whitespace-pre-wrap text-gray-800 bg-gray-50 border rounded-md p-3">
-          {goal.text}
-        </div>
-      )}
-    </li>
+    <div className="rounded-lg border p-3">
+      <div className="text-xs text-gray-600">{title}</div>
+      <div className="text-lg font-semibold">{value}</div>
+    </div>
   );
 }

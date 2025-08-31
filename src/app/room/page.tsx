@@ -5,116 +5,170 @@ import { useAuth } from '@/lib/auth';
 
 const CAD = (n:number)=>n.toLocaleString(undefined,{style:'currency',currency:'CAD',maximumFractionDigits:0});
 
-function SmallDonut({ filled, total, label }:{filled:number,total:number,label:string}) {
-  const pct = total>0 ? Math.min(100, Math.max(0, (filled/total)*100)) : 0;
-  const r=36, c=2*Math.PI*r;
-  const off = c*(1-pct/100);
-  return (
-    <div className="flex flex-col items-center">
-      <svg width="96" height="96" viewBox="0 0 96 96">
-        <circle cx="48" cy="48" r={r} fill="none" stroke="#eef2ff" strokeWidth="12"/>
-        <circle cx="48" cy="48" r={r} fill="none" stroke="#6366f1" strokeWidth="12"
-                strokeDasharray={c} strokeDashoffset={off} strokeLinecap="round"
-                transform="rotate(-90 48 48)"/>
-        <text x="48" y="52" textAnchor="middle" fontSize="14" className="font-medium">{Math.round(pct)}%</text>
-      </svg>
-      <div className="text-xs text-gray-600">{label} filled</div>
-    </div>
-  );
-}
-
 export default function RoomPage() {
   const { session } = useAuth();
   const token = session?.access_token ?? '';
-  const y = new Date().getFullYear();
 
-  const [tfsaRoom,setTfsaRoom]=useState<string>('');   // allow blank
-  const [rrspRoom,setRrspRoom]=useState<string>('');
-  const [tfsaDep,setTfsaDep]=useState<string>('');
-  const [rrspDep,setRrspDep]=useState<string>('');
-  const [msg,setMsg]=useState('');
+  const year = new Date().getFullYear();
 
-  async function load() {
+  // contribution room
+  const [tfsaRoom, setTfsaRoom] = useState<string>(''); // keep as string to avoid forced "0"
+  const [rrspRoom, setRrspRoom] = useState<string>('');
+  // deposited so far
+  const [tfsaDep, setTfsaDep] = useState<string>('');
+  const [rrspDep, setRrspDep] = useState<string>('');
+  const [msg, setMsg] = useState<string>('');
+
+  // load saved values
+  useEffect(()=>{
     if (!token) return;
-    // room
-    const r1 = await fetch(`/api/rooms?year=${y}`,{headers:{authorization:`Bearer ${token}`}});
-    const j1 = await r1.json();
-    if (j1?.ok) {
-      setTfsaRoom(j1.room?.tfsa ? String(j1.room.tfsa) : '');
-      setRrspRoom(j1.room?.rrsp ? String(j1.room.rrsp) : '');
-    }
-    // progress
-    const r2 = await fetch(`/api/rooms/progress?year=${y}`,{headers:{authorization:`Bearer ${token}`}});
-    const j2 = await r2.json();
-    if (j2?.ok) {
-      setTfsaDep(j2.progress?.tfsa_deposited ? String(j2.progress.tfsa_deposited) : '');
-      setRrspDep(j2.progress?.rrsp_deposited ? String(j2.progress.rrsp_deposited) : '');
-    }
-  }
+    (async ()=>{
+      const [r1, r2] = await Promise.all([
+        fetch('/api/rooms', { headers:{ authorization:`Bearer ${token}`}}).then(r=>r.json()),
+        fetch('/api/rooms/progress', { headers:{ authorization:`Bearer ${token}`}}).then(r=>r.json()),
+      ]);
 
-  useEffect(()=>{ load(); /* eslint-disable-next-line */},[token]);
+      if (r1?.room) {
+        setTfsaRoom(r1.room.tfsa ? String(r1.room.tfsa) : '');
+        setRrspRoom(r1.room.rrsp ? String(r1.room.rrsp) : '');
+      }
+      if (r2?.progress) {
+        setTfsaDep(r2.progress.tfsa_deposited ? String(r2.progress.tfsa_deposited) : '');
+        setRrspDep(r2.progress.rrsp_deposited ? String(r2.progress.rrsp_deposited) : '');
+      }
+    })();
+  },[token]);
 
-  async function saveRoom() {
-    const body = { year: y, tfsa: Number(tfsaRoom||0), rrsp: Number(rrspRoom||0) };
-    const r = await fetch('/api/rooms',{method:'PUT',headers:{'content-type':'application/json',authorization:`Bearer ${token}`},body:JSON.stringify(body)});
-    const j = await r.json();
-    if (!j?.ok) setMsg(`Error: ${j?.error||'Save failed'}`); else setMsg('Saved.');
-    setTimeout(()=>setMsg(''),1500);
-  }
-  async function saveProgress() {
-    const body = { year: y, tfsa_deposited: Number(tfsaDep||0), rrsp_deposited: Number(rrspDep||0) };
-    const r = await fetch('/api/rooms/progress',{method:'PUT',headers:{'content-type':'application/json',authorization:`Bearer ${token}`},body:JSON.stringify(body)});
-    const j = await r.json();
-    if (!j?.ok) setMsg(`Error: ${j?.error||'Save failed'}`); else setMsg('Saved.');
-    setTimeout(()=>setMsg(''),1500);
-  }
+  const saveRoom = async ()=>{
+    setMsg('');
+    const res = await fetch('/api/rooms', {
+      method:'POST',
+      headers:{ 'content-type':'application/json', authorization:`Bearer ${token}` },
+      body: JSON.stringify({
+        tfsa: Number(tfsaRoom||0),
+        rrsp: Number(rrspRoom||0),
+      })
+    });
+    const j = await res.json();
+    setMsg(j?.ok ? 'Saved!' : `Error: ${j?.error ?? 'Unknown'}`);
+  };
 
-  const tfsaRoomNum = Number(tfsaRoom||0);
-  const rrspRoomNum = Number(rrspRoom||0);
-  const tfsaDepNum  = Number(tfsaDep||0);
-  const rrspDepNum  = Number(rrspDep||0);
+  const saveProgress = async ()=>{
+    setMsg('');
+    const res = await fetch('/api/rooms/progress', {
+      method:'POST',
+      headers:{ 'content-type':'application/json', authorization:`Bearer ${token}` },
+      body: JSON.stringify({
+        tfsa_deposited: Number(tfsaDep||0),
+        rrsp_deposited: Number(rrspDep||0),
+      })
+    });
+    const j = await res.json();
+    setMsg(j?.ok ? 'Saved!' : `Error: ${j?.error ?? 'Unknown'}`);
+  };
+
+  const tfsaPct = useMemo(()=>{
+    const room = Number(tfsaRoom||0);
+    const dep  = Number(tfsaDep||0);
+    if (room<=0) return 0;
+    return Math.max(0, Math.min(100, Math.round((dep/room)*100)));
+  },[tfsaRoom, tfsaDep]);
+
+  const rrspPct = useMemo(()=>{
+    const room = Number(rrspRoom||0);
+    const dep  = Number(rrspDep||0);
+    if (room<=0) return 0;
+    return Math.max(0, Math.min(100, Math.round((dep/room)*100)));
+  },[rrspRoom, rrspDep]);
 
   return (
-    <main className="max-w-4xl mx-auto p-4 space-y-6">
-      <div className="rounded-xl border bg-white p-4">
-        <div className="text-sm font-medium mb-3">Contribution Room — {y}</div>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          <input className="border rounded-lg px-3 py-2" placeholder="e.g. 6500" inputMode="decimal" value={tfsaRoom} onChange={e=>setTfsaRoom(e.target.value.replace(/[^\d.]/g,''))}/>
-          <input className="border rounded-lg px-3 py-2" placeholder="e.g. 18000" inputMode="decimal" value={rrspRoom} onChange={e=>setRrspRoom(e.target.value.replace(/[^\d.]/g,''))}/>
-        </div>
-        <div className="mt-3 flex gap-3">
-          <button onClick={saveRoom} className="rounded-lg bg-blue-600 text-white px-4 py-2">Save</button>
-          <label className="inline-flex items-center gap-2 px-3 py-2 border rounded-lg cursor-pointer">
-            <input type="file" accept="application/pdf" className="hidden" onChange={async(e)=>{
-              if (!e.currentTarget.files?.[0]) return;
-              // placeholder endpoint – just shows success for now
-              const r = await fetch('/api/rooms/upload',{method:'POST',headers:{authorization:`Bearer ${token}`}});
-              const j = await r.json();
-              setMsg(j?.message || 'Uploaded');
-              setTimeout(()=>setMsg(''),1500);
-            }}/>
-            Upload CRA Notice (PDF)
+    <main className="max-w-5xl mx-auto p-4 space-y-6">
+
+      <section className="rounded-2xl border bg-white p-4">
+        <div className="text-sm font-medium mb-3">Contribution Room — {year}</div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <label className="block">
+            <span className="text-sm text-gray-600">TFSA room</span>
+            <input
+              inputMode="decimal"
+              className="mt-1 w-full border rounded-lg px-3 py-2"
+              placeholder="e.g. 6500"
+              value={tfsaRoom}
+              onChange={e=>setTfsaRoom(e.target.value)}
+            />
+          </label>
+          <label className="block">
+            <span className="text-sm text-gray-600">RRSP room</span>
+            <input
+              inputMode="decimal"
+              className="mt-1 w-full border rounded-lg px-3 py-2"
+              placeholder="e.g. 18000"
+              value={rrspRoom}
+              onChange={e=>setRrspRoom(e.target.value)}
+            />
           </label>
         </div>
-      </div>
+        <button
+          onClick={saveRoom}
+          disabled={!token}
+          className="mt-3 rounded-lg bg-blue-600 text-white px-4 py-2 disabled:opacity-50"
+        >Save</button>
+      </section>
 
-      <div className="rounded-xl border bg-white p-4">
-        <div className="text-sm font-medium mb-3">Deposited so far — {y}</div>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          <input className="border rounded-lg px-3 py-2" placeholder="TFSA deposited (e.g. 2200)" inputMode="decimal" value={tfsaDep} onChange={e=>setTfsaDep(e.target.value.replace(/[^\d.]/g,''))}/>
-          <input className="border rounded-lg px-3 py-2" placeholder="RRSP deposited (e.g. 7400)" inputMode="decimal" value={rrspDep} onChange={e=>setRrspDep(e.target.value.replace(/[^\d.]/g,''))}/>
+      <section className="rounded-2xl border bg-white p-4">
+        <div className="text-sm font-medium mb-3">Deposited so far — {year}</div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <label className="block">
+            <span className="text-sm text-gray-600">TFSA deposited</span>
+            <input
+              inputMode="decimal"
+              className="mt-1 w-full border rounded-lg px-3 py-2"
+              placeholder="e.g. 2200"
+              value={tfsaDep}
+              onChange={e=>setTfsaDep(e.target.value)}
+            />
+          </label>
+          <label className="block">
+            <span className="text-sm text-gray-600">RRSP deposited</span>
+            <input
+              inputMode="decimal"
+              className="mt-1 w-full border rounded-lg px-3 py-2"
+              placeholder="e.g. 7400"
+              value={rrspDep}
+              onChange={e=>setRrspDep(e.target.value)}
+            />
+          </label>
         </div>
-        <div className="mt-3">
-          <button onClick={saveProgress} className="rounded-lg bg-blue-600 text-white px-4 py-2">Save</button>
-        </div>
+        <button
+          onClick={saveProgress}
+          disabled={!token}
+          className="mt-3 rounded-lg bg-blue-600 text-white px-4 py-2 disabled:opacity-50"
+        >Save</button>
 
+        {/* little donuts */}
         <div className="mt-4 flex gap-8">
-          <SmallDonut filled={tfsaDepNum} total={tfsaRoomNum} label="TFSA"/>
-          <SmallDonut filled={rrspDepNum} total={rrspRoomNum} label="RRSP"/>
+          <MiniDonut label="TFSA filled" pct={tfsaPct}/>
+          <MiniDonut label="RRSP filled" pct={rrspPct}/>
         </div>
-      </div>
+      </section>
 
       {msg && <div className="text-sm">{msg}</div>}
     </main>
+  );
+}
+
+function MiniDonut({ pct, label }:{pct:number,label:string}) {
+  const R=40, C=2*Math.PI*R;
+  const off = C*(1 - pct/100);
+  return (
+    <div className="flex items-center gap-3">
+      <svg width="100" height="100" viewBox="0 0 100 100">
+        <circle cx="50" cy="50" r={R} stroke="#e5e7eb" strokeWidth="10" fill="none"/>
+        <circle cx="50" cy="50" r={R} stroke="#3b82f6" strokeWidth="10" fill="none"
+                strokeDasharray={C} strokeDashoffset={off} transform="rotate(-90 50 50)"/>
+        <text x="50" y="52" textAnchor="middle" fontSize="14" className="font-semibold">{pct}%</text>
+      </svg>
+      <div className="text-xs text-gray-600">{label}</div>
+    </div>
   );
 }
