@@ -1,211 +1,281 @@
 'use client';
 
+/* ACCOUNTS_PAGE_TIDY_V3 */
+
 import { useEffect, useState } from 'react';
 import { useAuth } from '@/lib/auth';
 
 type Account = {
-  id: string;
+  id: string | number;
   institution: string;
   type: string;
   balance: number;
-  changed?: boolean; // track whether Save should be enabled
+  changed?: boolean; // enables Save only after an edit
 };
+
+const TYPES = ['TFSA', 'RRSP', 'RESP', 'LIRA', 'Margin', 'Other'] as const;
+
+function normalizeAccounts(input: any): Account[] {
+  const arr = Array.isArray(input) ? input : [];
+  return arr.map((r: any) => ({
+    id: r.id ?? r.ID ?? r.pk ?? String(Math.random()),
+    institution: String(r.institution ?? r.name ?? '').trim(),
+    type: String(r.type ?? 'Other'),
+    balance: Number(r.balance ?? 0),
+  }));
+}
 
 export default function AccountsPage() {
   const { session } = useAuth();
   const token = session?.access_token ?? '';
+  const [error, setError] = useState<string | null>(null);
 
   const [accounts, setAccounts] = useState<Account[]>([]);
-  const [newInstitution, setNewInstitution] = useState('');
-  const [newType, setNewType] = useState('TFSA');
-  const [newBalance, setNewBalance] = useState<number | ''>('');
+  const [loading, setLoading] = useState(false);
 
-  // Fetch accounts
+  // “Add” row state
+  const [newInstitution, setNewInstitution] = useState('');
+  const [newType, setNewType] = useState<(typeof TYPES)[number]>('TFSA');
+  const [newBalance, setNewBalance] = useState<string>(''); // keep as string to allow blank
+
   useEffect(() => {
     if (!token) return;
     (async () => {
-      const res = await fetch('/api/accounts', {
-        headers: { authorization: `Bearer ${token}` },
-      });
-      const j = await res.json();
-      if (j?.ok) setAccounts(j.data);
+      try {
+        setLoading(true);
+        setError(null);
+        const res = await fetch('/api/accounts', {
+          headers: { authorization: `Bearer ${token}` },
+        });
+        const j = await res.json().catch(() => ({}));
+        const raw =
+          j?.data ??
+          j?.accounts ??
+          j?.rows ??
+          (Array.isArray(j) ? j : []);
+        setAccounts(normalizeAccounts(raw));
+      } catch (e: any) {
+        setError(e?.message ?? 'Failed to load accounts.');
+      } finally {
+        setLoading(false);
+      }
     })();
   }, [token]);
 
-  // Handle add
-  const handleAdd = async () => {
-    if (!newInstitution || newBalance === '') return;
-    const body = { institution: newInstitution, type: newType, balance: +newBalance };
-    const res = await fetch('/api/accounts', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify(body),
-    });
-    const j = await res.json();
-    if (j?.ok) {
-      setAccounts([...accounts, j.account]);
+  async function addAccount() {
+    try {
+      setError(null);
+      if (!newInstitution.trim() || newBalance === '') return;
+      const body = {
+        institution: newInstitution.trim(),
+        type: newType,
+        balance: Number(newBalance) || 0,
+      };
+      const res = await fetch('/api/accounts', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(body),
+      });
+      const j = await res.json().catch(() => ({}));
+      // accept {ok, account} OR return entire list again
+      if (j?.account) {
+        setAccounts((a) => [...a, ...normalizeAccounts([j.account])]);
+      } else {
+        const raw =
+          j?.data ??
+          j?.accounts ??
+          j?.rows ??
+          (Array.isArray(j) ? j : []);
+        if (Array.isArray(raw) && raw.length) {
+          setAccounts(normalizeAccounts(raw));
+        } else {
+          // best effort: push local optimistic row
+          setAccounts((a) => [
+            ...a,
+            {
+              id: crypto.randomUUID?.() ?? Math.random(),
+              institution: body.institution,
+              type: body.type,
+              balance: body.balance,
+            },
+          ]);
+        }
+      }
       setNewInstitution('');
       setNewType('TFSA');
       setNewBalance('');
+    } catch (e: any) {
+      setError(e?.message ?? 'Failed to add account.');
     }
-  };
+  }
 
-  // Handle save
-  const handleSave = async (id: string) => {
-    const acct = accounts.find((a) => a.id === id);
-    if (!acct) return;
-    const res = await fetch(`/api/accounts/${id}`, {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-        authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({ balance: acct.balance }),
-    });
-    const j = await res.json();
-    if (j?.ok) {
-      setAccounts((prev) =>
-        prev.map((a) => (a.id === id ? { ...a, changed: false } : a))
-      );
+  async function saveAccount(id: string | number) {
+    try {
+      setError(null);
+      const row = accounts.find((a) => a.id === id);
+      if (!row) return;
+      const res = await fetch(`/api/accounts/${id}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          institution: row.institution ?? '',
+          type: row.type ?? 'Other',
+          balance: Number(row.balance) || 0,
+        }),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (j?.ok !== false) {
+        setAccounts((prev) =>
+          prev.map((a) => (a.id === id ? { ...a, changed: false } : a))
+        );
+      } else {
+        setError(j?.message ?? 'Failed to save account.');
+      }
+    } catch (e: any) {
+      setError(e?.message ?? 'Failed to save account.');
     }
-  };
+  }
 
-  // Handle delete
-  const handleDelete = async (id: string) => {
-    const res = await fetch(`/api/accounts/${id}`, {
-      method: 'DELETE',
-      headers: { authorization: `Bearer ${token}` },
-    });
-    const j = await res.json();
-    if (j?.ok) {
-      setAccounts(accounts.filter((a) => a.id !== id));
+  async function deleteAccount(id: string | number) {
+    try {
+      setError(null);
+      const res = await fetch(`/api/accounts/${id}`, {
+        method: 'DELETE',
+        headers: { authorization: `Bearer ${token}` },
+      });
+      const j = await res.json().catch(() => ({}));
+      if (j?.ok !== false) {
+        setAccounts((prev) => prev.filter((a) => a.id !== id));
+      } else {
+        setError(j?.message ?? 'Failed to delete account.');
+      }
+    } catch (e: any) {
+      setError(e?.message ?? 'Failed to delete account.');
     }
-  };
+  }
 
-  // Handle change tracking
-  const handleInstitutionChange = (id: string, value: string) => {
+  function setRow<K extends keyof Account>(id: string | number, key: K, val: Account[K]) {
     setAccounts((prev) =>
-      prev.map((a) =>
-        a.id === id ? { ...a, institution: value, changed: true } : a
-      )
+      prev.map((a) => (a.id === id ? { ...a, [key]: val, changed: true } : a))
     );
-  };
-
-  const handleTypeChange = (id: string, value: string) => {
-    setAccounts((prev) =>
-      prev.map((a) => (a.id === id ? { ...a, type: value, changed: true } : a))
-    );
-  };
-
-  const handleBalanceChange = (id: string, value: string) => {
-    setAccounts((prev) =>
-      prev.map((a) =>
-        a.id === id ? { ...a, balance: +value, changed: true } : a
-      )
-    );
-  };
+  }
 
   return (
-    <main className="max-w-4xl mx-auto p-4 space-y-6">
-      {/* Add Account Row */}
-      <div className="rounded-2xl border bg-white p-4 shadow-sm">
+    <main className="mx-auto max-w-4xl p-4 space-y-6">
+      {/* Add account */}
+      <section className="rounded-2xl border bg-white p-4 shadow-sm">
         <div className="flex items-center gap-3">
           <input
-            type="text"
             value={newInstitution}
             onChange={(e) => setNewInstitution(e.target.value)}
-            className="border rounded px-2 py-1 w-40"
+            className="w-40 rounded border px-2 py-1"
             placeholder="Institution (e.g., BMO)"
           />
           <select
             value={newType}
-            onChange={(e) => setNewType(e.target.value)}
-            className="border rounded px-2 py-1 w-32"
+            onChange={(e) => setNewType(e.target.value as any)}
+            className="w-32 rounded border px-2 py-1"
           >
-            <option value="TFSA">TFSA</option>
-            <option value="RRSP">RRSP</option>
-            <option value="RESP">RESP</option>
-            <option value="LIRA">LIRA</option>
-            <option value="Margin">Margin</option>
-            <option value="Other">Other</option>
+            {TYPES.map((t) => (
+              <option key={t} value={t}>
+                {t}
+              </option>
+            ))}
           </select>
           <input
             type="number"
+            inputMode="decimal"
             value={newBalance}
-            onChange={(e) => setNewBalance(e.target.value === '' ? '' : +e.target.value)}
-            className="border rounded px-2 py-1 w-32 text-right"
+            onChange={(e) => setNewBalance(e.target.value)}
+            className="w-32 rounded border px-2 py-1 text-right"
             placeholder="Balance"
           />
           <button
-            onClick={handleAdd}
-            className="px-3 py-1 rounded bg-blue-500 text-white"
+            onClick={addAccount}
+            className="rounded bg-blue-600 px-4 py-1.5 text-white"
           >
             Add
           </button>
         </div>
         <p className="mt-2 text-xs text-gray-500">
-          Tip: balances can be updated anytime; Save becomes clickable only when a change is made.
+          Save becomes clickable only after you change a row.
         </p>
-      </div>
+      </section>
 
-      {/* Accounts List */}
-      <div className="rounded-2xl border bg-white p-4 shadow-sm space-y-2">
-        <h2 className="text-sm font-medium mb-2">Your accounts</h2>
-        {accounts.map((acct) => (
-          <div key={acct.id} className="flex items-center gap-3">
-            {/* Institution */}
-            <input
-              type="text"
-              value={acct.institution}
-              onChange={(e) => handleInstitutionChange(acct.id, e.target.value)}
-              className="border rounded px-2 py-1 w-40"
-              placeholder="Institution"
-            />
-            {/* Type */}
-            <select
-              value={acct.type}
-              onChange={(e) => handleTypeChange(acct.id, e.target.value)}
-              className="border rounded px-2 py-1 w-32"
-            >
-              <option value="TFSA">TFSA</option>
-              <option value="RRSP">RRSP</option>
-              <option value="RESP">RESP</option>
-              <option value="LIRA">LIRA</option>
-              <option value="Margin">Margin</option>
-              <option value="Other">Other</option>
-            </select>
-            {/* Balance */}
-            <input
-              type="number"
-              value={acct.balance}
-              onChange={(e) => handleBalanceChange(acct.id, e.target.value)}
-              className="border rounded px-2 py-1 w-32 text-right"
-              placeholder="Balance"
-            />
-            {/* Buttons */}
-            <button
-              onClick={() => handleSave(acct.id)}
-              disabled={!acct.changed}
-              className={`px-3 py-1 rounded ${
-                acct.changed
-                  ? 'bg-blue-500 text-white'
-                  : 'bg-gray-300 text-gray-600 cursor-not-allowed'
-              }`}
-            >
-              Save
-            </button>
-            <button
-              onClick={() => handleDelete(acct.id)}
-              className="px-3 py-1 rounded bg-red-500 text-white"
-            >
-              Delete
-            </button>
+      {/* Your accounts */}
+      <section className="rounded-2xl border bg-white p-4 shadow-sm">
+        <div className="mb-2 text-sm font-medium">Your accounts</div>
+
+        {error && (
+          <div className="mb-3 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+            {error}
           </div>
-        ))}
-      </div>
+        )}
+
+        {loading ? (
+          <div className="p-3 text-sm text-gray-600">Loading…</div>
+        ) : accounts.length === 0 ? (
+          <div className="p-3 text-sm text-gray-500">No accounts yet.</div>
+        ) : (
+          <div className="space-y-2">
+            {accounts.map((a) => (
+              <div key={a.id} className="flex items-center gap-3">
+                <input
+                  value={a.institution ?? ''}
+                  onChange={(e) => setRow(a.id, 'institution', e.target.value)}
+                  className="w-40 rounded border px-2 py-1"
+                  placeholder="Institution"
+                />
+                <select
+                  value={a.type ?? 'Other'}
+                  onChange={(e) => setRow(a.id, 'type', e.target.value)}
+                  className="w-32 rounded border px-2 py-1"
+                >
+                  {TYPES.map((t) => (
+                    <option key={t} value={t}>
+                      {t}
+                    </option>
+                  ))}
+                </select>
+                <input
+                  type="number"
+                  inputMode="decimal"
+                  value={Number.isFinite(a.balance) ? a.balance : 0}
+                  onChange={(e) =>
+                    setRow(a.id, 'balance', Number(e.target.value))
+                  }
+                  className="w-32 rounded border px-2 py-1 text-right"
+                  placeholder="Balance"
+                />
+                <button
+                  onClick={() => saveAccount(a.id)}
+                  disabled={!a.changed}
+                  className={
+                    a.changed
+                      ? 'rounded bg-blue-600 px-3 py-1.5 text-white'
+                      : 'rounded bg-gray-300 px-3 py-1.5 text-gray-600 cursor-not-allowed'
+                  }
+                >
+                  Save
+                </button>
+                <button
+                  onClick={() => deleteAccount(a.id)}
+                  className="rounded bg-red-500 px-3 py-1.5 text-white"
+                >
+                  Delete
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
     </main>
   );
 }
+
