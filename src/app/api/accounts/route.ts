@@ -3,15 +3,18 @@ import { getRouteClient, jsonErr, jsonOK, requireUser } from '@/lib/supabaseRout
 
 export async function GET(req: NextRequest) {
   try {
-    await requireUser(req);
+    const user = await requireUser(req);
     const { supabase } = getRouteClient(req);
+
     const { data, error } = await supabase
       .from('manual_accounts')
-      .select('id,institution,type,balance,source,created_at,updated_at')
-      .order('updated_at', { ascending: false });
+      .select('id,institution,type,balance,source,created_at')
+      .eq('user_id', user.id)
+      .order('created_at', { ascending: false });
+
     if (error) throw error;
     return jsonOK({ ok: true, accounts: data ?? [] });
-  } catch (e:any) {
+  } catch (e: any) {
     return jsonErr(e?.message ?? 'Server error', e?.status ?? 500);
   }
 }
@@ -19,27 +22,41 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const user = await requireUser(req);
-    const body = await req.json();
-    const inst = `${body?.institution ?? ''}`.trim();
-    const type = `${body?.type ?? ''}`.trim();
-    const balance = Number(body?.balance ?? 0);
-    if (!inst || !type || !isFinite(balance)) return jsonErr('Invalid payload', 400);
-
     const { supabase } = getRouteClient(req);
-    const { data, error } = await supabase
+    const { institution, type, balance } = await req.json();
+
+    const { data: inserted, error } = await supabase
       .from('manual_accounts')
-      .insert([{ user_id: user.id, institution: inst, type, balance, source: 'manual' }])
-      .select('id,institution,type,balance,source,created_at,updated_at')
+      .insert({
+        user_id: user.id,
+        institution,
+        type,
+        balance: Number(balance || 0),
+        source: 'manual',
+      })
+      .select()
       .single();
+
     if (error) throw error;
 
-    await fetch(new URL('/api/snapshots', req.url), {
-      method: 'POST',
-      headers: { authorization: req.headers.get('authorization') ?? '' },
-    });
+    // Recompute total and UPSERT today's snapshot
+    const { data: sumRows, error: sumErr } = await supabase
+      .from('manual_accounts')
+      .select('balance')
+      .eq('user_id', user.id);
+    if (sumErr) throw sumErr;
 
-    return jsonOK({ ok: true, account: data });
-  } catch (e:any) {
+    const total = (sumRows ?? []).reduce((a, r: any) => a + Number(r.balance || 0), 0);
+    const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+
+    const { error: upErr } = await supabase
+      .from('account_snapshots')
+      .upsert({ user_id: user.id, taken_on: today, total }, { onConflict: 'user_id,taken_on' });
+
+    if (upErr) throw upErr;
+
+    return jsonOK({ ok: true, account: inserted });
+  } catch (e: any) {
     return jsonErr(e?.message ?? 'Server error', e?.status ?? 500);
   }
 }
