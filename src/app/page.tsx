@@ -97,14 +97,19 @@ function Donut({
 
 type Pt = { m: number; v: number };
 
-// exact fractional months from “now”
+// fractional months from now (negative = past)
 function monthsFromNow(d: Date) {
   const now = new Date();
   const ms = d.getTime() - now.getTime();
   return ms / (1000 * 60 * 60 * 24 * 30.4375); // avg month length
 }
+function dateFromMonths(m: number) {
+  const now = new Date();
+  const ms = m * 30.4375 * 24 * 3600 * 1000;
+  return new Date(now.getTime() + ms);
+}
 
-// compact Y-axis labels (no CA to avoid clipping)
+// compact Y-axis labels
 const compact = (n: number) =>
   new Intl.NumberFormat(undefined, {
     notation: 'compact',
@@ -161,16 +166,15 @@ function Chart({
     return `${mkLine(pts)} L ${sx(last.m)} ${sy(0)} L ${sx(first.m)} ${sy(0)} Z`;
   };
 
-  // Y ticks
-  const ticksY = 5;
-  const yTicks = new Array(ticksY + 1)
-    .fill(0)
-    .map((_, i) => minY + (i * (maxY - minY)) / ticksY);
-
-  // X ticks (months for <=2y, otherwise “about 10 labels”, skipping as needed)
-  const showMonthly = yearsFuture <= 2;
+  // ===== X ticks: weekly (<= 0.5y), monthly (<= 2y), yearly (> 2y) =====
+  const showWeekly = yearsFuture <= 0.5;    // <= 6 months
+  const showMonthly = !showWeekly && yearsFuture <= 2;
   const xTicks: number[] = [];
-  if (showMonthly) {
+  if (showWeekly) {
+    const weekM = 7 / 30.4375;
+    const start = Math.ceil(minX / weekM) * weekM;
+    for (let m = start; m <= maxX + 1e-6; m += weekM) xTicks.push(m);
+  } else if (showMonthly) {
     for (let m = Math.ceil(minX); m <= Math.floor(maxX); m += 1) xTicks.push(m);
   } else {
     const startYear = Math.ceil(minX / 12);
@@ -180,7 +184,7 @@ function Chart({
     for (let y = startYear; y <= endYear; y += step) xTicks.push(y * 12);
   }
 
-  // Tooltip (kept as-is)
+  // ===== Tooltip (stays pinned to cursor; auto-flips near right edge) =====
   const [hover, setHover] = useState<{ x: number; y: number; m: number } | null>(
     null
   );
@@ -216,14 +220,17 @@ function Chart({
     return proj[proj.length - 1].v;
   };
 
-  const dec = yearsFuture > 10 ? 5 : 1;
-  const minusLabel = yearsFuture > 10 ? '-5' : '-1';
-  const onMinus = () => onSetYearsFuture(Math.max(1, yearsFuture - dec));
-  const onPlus = () => onSetYearsFuture(Math.min(40, yearsFuture + 5));
+  // ===== Zoom buttons: finer steps for small windows =====
+  const step =
+    yearsFuture <= 0.5 ? 0.1 : yearsFuture <= 2 ? 0.5 : 5; // years
+  const minusLabel = `-${step}`;
+  const plusLabel = `+${step}`;
+  const onMinus = () => onSetYearsFuture(Math.max(0.1, +(yearsFuture - step).toFixed(2)));
+  const onPlus = () => onSetYearsFuture(Math.min(40, +(yearsFuture + step).toFixed(2)));
 
-  // tooltip layout (auto-flip)
-  const tipW = 160;
-  const tipH = 38;
+  // ===== Tooltip layout =====
+  const tipW = 170;
+  const tipH = 40;
   const tipPad = 8;
   const tipX = hover
     ? hover.x + tipPad + tipW > w - padR
@@ -233,6 +240,12 @@ function Chart({
   const tipY = hover
     ? Math.min(h - padB - tipH, Math.max(padT, hover.y - tipH / 2))
     : 0;
+
+  // ===== Y ticks =====
+  const ticksY = 5;
+  const yTicks = new Array(ticksY + 1)
+    .fill(0)
+    .map((_, i) => minY + (i * (maxY - minY)) / ticksY);
 
   return (
     <div className="rounded-2xl border bg-white p-4 shadow-sm">
@@ -292,33 +305,23 @@ function Chart({
         ))}
 
         {/* x ticks */}
-        {xTicks.map((m, i) => (
+        {xTicks.map((m, i) => {
+          const d = dateFromMonths(m);
+          const label = showWeekly
+            ? d.toLocaleString(undefined, { month: 'short', day: '2-digit' })
+            : showMonthly
+            ? d.toLocaleString(undefined, { month: 'short' })
+            : String(d.getFullYear());
+        return (
           <g key={`x-${i}`}>
-            <line
-              x1={sx(m)}
-              y1={h - padB}
-              x2={sx(m)}
-              y2={h - padB + 6}
-              stroke="#d1d5db"
-            />
-            <text
-              x={sx(m)}
-              y={h - padB + 18}
-              fontSize="10"
-              textAnchor="middle"
-              fill="#6b7280"
-            >
-              {showMonthly
-                ? new Date(
-                    new Date().getFullYear(),
-                    new Date().getMonth() + m
-                  ).toLocaleString(undefined, { month: 'short' })
-                : String(new Date().getFullYear() + Math.round(m / 12))}
+            <line x1={sx(m)} y1={h - padB} x2={sx(m)} y2={h - padB + 6} stroke="#d1d5db" />
+            <text x={sx(m)} y={h - padB + 18} fontSize="10" textAnchor="middle" fill="#6b7280">
+              {label}
             </text>
           </g>
-        ))}
+        );})}
 
-        {/* ACTUAL */}
+        {/* ACTUAL (with area) */}
         {actual.length > 1 && <path d={mkArea(actual)} fill="#11182714" />}
         {actual.length > 1 && (
           <path d={mkLine(actual)} fill="none" stroke="#111827" strokeWidth={2.5} />
@@ -357,10 +360,11 @@ function Chart({
             <rect x={tipX} y={tipY} width={tipW} height={tipH} rx={6} fill="white" stroke="#e5e7eb" />
             <text x={tipX + 8} y={tipY + 15} fontSize="11" fill="#374151">
               Date:{' '}
-              {new Date(
-                new Date().getFullYear(),
-                new Date().getMonth() + Math.round(hover.m)
-              ).toLocaleString(undefined, { month: 'short', year: 'numeric' })}
+              {dateFromMonths(hover.m).toLocaleString(undefined, {
+                month: 'short',
+                day: showWeekly ? '2-digit' : undefined,
+                year: showWeekly || showMonthly ? undefined : 'numeric',
+              })}
             </text>
             <text x={tipX + 8} y={tipY + 29} fontSize="11" fill="#374151">
               Value: {CAD(Math.round(valueAt(hover.m)))}
@@ -374,7 +378,7 @@ function Chart({
           {minusLabel}
         </button>
         <button onClick={onPlus} className="rounded-md border px-3 py-1 text-sm">
-          +5
+          {plusLabel}
         </button>
       </div>
     </div>
@@ -401,8 +405,7 @@ export default function Dashboard() {
     })();
   }, [token]);
 
-  // ACTUAL series using fractional months + day-bucketing
-  // + anti-vertical “beautifier”: ensure at least one anchor ~15 days back
+  // ACTUAL series with day bucketing + anti-vertical anchor
   const actual = useMemo(() => {
     const rows = summary?.history ?? [];
     const pts: Pt[] = rows
@@ -410,41 +413,35 @@ export default function Dashboard() {
         m: monthsFromNow(new Date(h.taken_on)),
         v: Number(h.total || 0),
       }))
-      .filter((p) => p.m <= 0) // only past
+      .filter((p) => p.m <= 0)
       .sort((a, b) => a.m - b.m);
 
-    // ensure a “today” point
+    // ensure “today”
     const todayV = summary?.overall ?? (pts.length ? pts[pts.length - 1].v : 0);
     pts.push({ m: 0, v: todayV });
 
-    // collapse to ~daily buckets
+    // collapse to ~daily
     const uniq: Pt[] = [];
     for (const p of pts) {
       const last = uniq[uniq.length - 1];
       if (!last || Math.abs(p.m - last.m) > 0.03) uniq.push(p);
-      else uniq[uniq.length - 1] = p; // keep latest in that day-bucket
+      else uniq[uniq.length - 1] = p;
     }
 
-    // ---- anti-vertical tweak ----
+    // anti-vertical: add an anchor 0.5 months back if needed
     if (uniq.length === 1) {
-      // only “today” -> add a short anchor 0.5 months back with same value
       uniq.unshift({ m: -0.5, v: uniq[0].v });
-    } else {
-      // if earliest point is too close to today (> -0.5m), prepend anchor
-      const first = uniq[0];
-      if (first.m > -0.5) {
-        uniq.unshift({ m: -0.5, v: first.v });
-      }
+    } else if (uniq[0].m > -0.5) {
+      uniq.unshift({ m: -0.5, v: uniq[0].v });
     }
-    // ----------------------------
 
     return uniq;
   }, [summary]);
 
-  // PROJECTION series
+  // PROJECTION
   const proj = useMemo(() => {
     const start = actual.length ? actual[actual.length - 1].v : summary?.overall ?? 0;
-    const months = yearsFuture * 12;
+    const months = Math.max(1, Math.round(yearsFuture * 12));
     const r = rate / 100 / 12;
     const out: Pt[] = [{ m: 0, v: start }];
     let v = start;
