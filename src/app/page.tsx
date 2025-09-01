@@ -169,19 +169,40 @@ function Chart({
   // ===== X ticks: weekly (<= 0.5y), monthly (<= 2y), yearly (> 2y) =====
   const showWeekly = yearsFuture <= 0.5;    // <= 6 months
   const showMonthly = !showWeekly && yearsFuture <= 2;
-  const xTicks: number[] = [];
+
+  // base ticks (dense)
+  const baseTicks: number[] = [];
   if (showWeekly) {
     const weekM = 7 / 30.4375;
     const start = Math.ceil(minX / weekM) * weekM;
-    for (let m = start; m <= maxX + 1e-6; m += weekM) xTicks.push(m);
+    for (let m = start; m <= maxX + 1e-6; m += weekM) baseTicks.push(m);
   } else if (showMonthly) {
-    for (let m = Math.ceil(minX); m <= Math.floor(maxX); m += 1) xTicks.push(m);
+    for (let m = Math.ceil(minX); m <= Math.floor(maxX); m += 1) baseTicks.push(m);
   } else {
     const startYear = Math.ceil(minX / 12);
     const endYear = Math.floor(maxX / 12);
-    const totalYears = endYear - startYear + 1;
-    const step = Math.max(1, Math.ceil(totalYears / 10));
-    for (let y = startYear; y <= endYear; y += step) xTicks.push(y * 12);
+    for (let y = startYear; y <= endYear; y += 1) baseTicks.push(y * 12);
+  }
+
+  // filter ticks to avoid label overlap
+  const minLabelGapPx = showWeekly ? 48 : showMonthly ? 56 : 64;
+  const ticks: { m: number; label: string }[] = [];
+  let lastLabelX = -Infinity;
+  for (const m of baseTicks) {
+    const x = sx(m);
+    if (x - lastLabelX < minLabelGapPx) {
+      // keep tick mark but skip label (we'll render tick; blank label)
+      ticks.push({ m, label: '' });
+      continue;
+    }
+    const d = dateFromMonths(m);
+    const label = showWeekly
+      ? d.toLocaleString(undefined, { month: 'short', day: '2-digit' })
+      : showMonthly
+      ? d.toLocaleString(undefined, { month: 'short' })
+      : String(d.getFullYear());
+    ticks.push({ m, label });
+    lastLabelX = x;
   }
 
   // ===== Tooltip (stays pinned to cursor; auto-flips near right edge) =====
@@ -220,9 +241,8 @@ function Chart({
     return proj[proj.length - 1].v;
   };
 
-  // ===== Zoom buttons: finer steps for small windows =====
-  const step =
-    yearsFuture <= 0.5 ? 0.1 : yearsFuture <= 2 ? 0.5 : 5; // years
+  // ===== Zoom buttons: fine steps for tight windows =====
+  const step = yearsFuture <= 0.5 ? 0.1 : yearsFuture <= 2 ? 0.5 : 5; // years
   const minusLabel = `-${step}`;
   const plusLabel = `+${step}`;
   const onMinus = () => onSetYearsFuture(Math.max(0.1, +(yearsFuture - step).toFixed(2)));
@@ -305,21 +325,16 @@ function Chart({
         ))}
 
         {/* x ticks */}
-        {xTicks.map((m, i) => {
-          const d = dateFromMonths(m);
-          const label = showWeekly
-            ? d.toLocaleString(undefined, { month: 'short', day: '2-digit' })
-            : showMonthly
-            ? d.toLocaleString(undefined, { month: 'short' })
-            : String(d.getFullYear());
-        return (
+        {ticks.map(({ m, label }, i) => (
           <g key={`x-${i}`}>
             <line x1={sx(m)} y1={h - padB} x2={sx(m)} y2={h - padB + 6} stroke="#d1d5db" />
-            <text x={sx(m)} y={h - padB + 18} fontSize="10" textAnchor="middle" fill="#6b7280">
-              {label}
-            </text>
+            {label && (
+              <text x={sx(m)} y={h - padB + 18} fontSize="10" textAnchor="middle" fill="#6b7280">
+                {label}
+              </text>
+            )}
           </g>
-        );})}
+        ))}
 
         {/* ACTUAL (with area) */}
         {actual.length > 1 && <path d={mkArea(actual)} fill="#11182714" />}
@@ -390,9 +405,36 @@ export default function Dashboard() {
   const token = session?.access_token ?? '';
 
   const [summary, setSummary] = useState<Summary | null>(null);
-  const [monthly, setMonthly] = useState<number>(0);
-  const [rate, setRate] = useState<number>(0);
+
+  // ------- persisted sliders -------
+  const defaultMonthly = 1000;
+  const defaultRate = 10;
+  const [monthly, setMonthly] = useState<number>(defaultMonthly);
+  const [rate, setRate] = useState<number>(defaultRate);
   const [yearsFuture, setYearsFuture] = useState<number>(10);
+
+  // load persisted on mount
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      const m = Number(localStorage.getItem('compoundly:monthly') ?? '');
+      const r = Number(localStorage.getItem('compoundly:rate') ?? '');
+      if (!Number.isNaN(m) && m >= 0) setMonthly(m);
+      if (!Number.isNaN(r) && r >= 0 && r <= 100) setRate(r);
+    } catch {}
+  }, []);
+
+  // persist on change (debounced-ish)
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const t = setTimeout(() => {
+      try {
+        localStorage.setItem('compoundly:monthly', String(monthly));
+        localStorage.setItem('compoundly:rate', String(rate));
+      } catch {}
+    }, 150);
+    return () => clearTimeout(t);
+  }, [monthly, rate]);
 
   useEffect(() => {
     if (!token) return;
@@ -405,7 +447,7 @@ export default function Dashboard() {
     })();
   }, [token]);
 
-  // ACTUAL series with day bucketing + anti-vertical anchor
+  // ACTUAL series using fractional months + anti-vertical anchor
   const actual = useMemo(() => {
     const rows = summary?.history ?? [];
     const pts: Pt[] = rows
@@ -416,7 +458,6 @@ export default function Dashboard() {
       .filter((p) => p.m <= 0)
       .sort((a, b) => a.m - b.m);
 
-    // ensure “today”
     const todayV = summary?.overall ?? (pts.length ? pts[pts.length - 1].v : 0);
     pts.push({ m: 0, v: todayV });
 
@@ -434,7 +475,6 @@ export default function Dashboard() {
     } else if (uniq[0].m > -0.5) {
       uniq.unshift({ m: -0.5, v: uniq[0].v });
     }
-
     return uniq;
   }, [summary]);
 
