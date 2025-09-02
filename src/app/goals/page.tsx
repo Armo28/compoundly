@@ -1,235 +1,437 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useAuth } from '@/lib/auth';
 
-type Rooms = { year: number; tfsa: number; rrsp: number };
-type Progress = { year: number; tfsa_deposited?: number; rrsp_deposited?: number; resp_deposited?: number };
-type Child = { id: string; name: string; birth_year: number };
-type Account = { id: string; name: string; type: 'TFSA' | 'RRSP' | 'RESP' | 'Margin' | 'Other' | 'LIRA'; balance: number };
+/* ---------- helpers ---------- */
 
 const CAD = (n: number) =>
-  n.toLocaleString(undefined, { style: 'currency', currency: 'CAD', maximumFractionDigits: 0 });
+  n.toLocaleString(undefined, {
+    style: 'currency',
+    currency: 'CAD',
+    maximumFractionDigits: 0,
+  });
 
-const monthYearLabel = (d = new Date()) =>
-  d.toLocaleString(undefined, { month: 'long', year: 'numeric' });
+const now = () => new Date();
+const year = () => now().getFullYear();
+const monthIndex = () => now().getMonth(); // 0..11
+const monthsLeftThisYear = () => Math.max(0, 12 - (monthIndex() + 1)); // e.g. September -> 3 months left
 
-/** Safe localStorage get (avoids SSR crashes) */
-function lsGetNumber(key: string, fallback: number) {
-  try {
-    if (typeof window === 'undefined') return fallback;
-    const raw = window.localStorage.getItem(key);
-    if (!raw) return fallback;
-    const n = Number(raw);
-    return Number.isFinite(n) ? n : fallback;
-  } catch {
-    return fallback;
-  }
+function clamp(n: number, lo: number, hi: number) {
+  return Math.min(hi, Math.max(lo, n));
 }
 
-/** Safe localStorage set */
-function lsSetNumber(key: string, value: number) {
+/* ---------- types (what the API returns) ---------- */
+
+type Rooms = { tfsa: number; rrsp: number; year: number } | null;
+type Progress = { tfsa_deposited: number; rrsp_deposited: number; year: number } | null;
+type Child = { id: string; name: string; birth_year: number };
+
+/* ---------- mic / notes persistence ---------- */
+
+type GoalNote = { id: string; ts: number; text: string };
+
+const NOTES_KEY = 'compoundly.goalNotes.v1';
+const PLEDGE_KEY = 'compoundly.monthlyPledge.v1';
+
+function loadNotes(): GoalNote[] {
+  if (typeof window === 'undefined') return [];
   try {
-    if (typeof window === 'undefined') return;
-    window.localStorage.setItem(key, String(value));
+    const raw = localStorage.getItem(NOTES_KEY);
+    return raw ? (JSON.parse(raw) as GoalNote[]) : [];
+  } catch {
+    return [];
+  }
+}
+function saveNotes(notes: GoalNote[]) {
+  try {
+    localStorage.setItem(NOTES_KEY, JSON.stringify(notes));
+  } catch {}
+}
+function loadPledge(): number {
+  if (typeof window === 'undefined') return 1000;
+  const v = Number(localStorage.getItem(PLEDGE_KEY));
+  return Number.isFinite(v) && v > 0 ? v : 1000; // default first-time: $1,000
+}
+function savePledge(v: number) {
+  try {
+    localStorage.setItem(PLEDGE_KEY, String(v));
   } catch {}
 }
 
+/* ---------- page ---------- */
+
 export default function GoalsPage() {
-  const { session, loading } = useAuth();
+  const { session } = useAuth();
   const token = session?.access_token ?? '';
 
-  // Persisted pledge slider (defaults: $1000 & 10% — you can show/use rate later if you like)
-  const [monthlyPledge, setMonthlyPledge] = useState<number>(() => lsGetNumber('goals_pledge', 1000));
-  useEffect(() => { lsSetNumber('goals_pledge', monthlyPledge); }, [monthlyPledge]);
+  const [pledge, setPledge] = useState<number>(loadPledge());
+  useEffect(() => savePledge(pledge), [pledge]);
 
-  // Data we need to compute the split
-  const [rooms, setRooms] = useState<Rooms | null>(null);
-  const [progress, setProgress] = useState<Progress | null>(null);
+  const [rooms, setRooms] = useState<Rooms>(null);
+  const [progress, setProgress] = useState<Progress>(null);
   const [children, setChildren] = useState<Child[]>([]);
-  const [accounts, setAccounts] = useState<Account[]>([]);
-  const [error, setError] = useState<string>('');
 
-  // Fetch everything when signed in
+  // mic state
+  const [recognizing, setRecognizing] = useState(false);
+  const [liveText, setLiveText] = useState('');
+  const recogRef = useRef<SpeechRecognition | null>(null);
+  const lastChunkRef = useRef<{ text: string; at: number }>({ text: '', at: 0 });
+  const [notes, setNotes] = useState<GoalNote[]>(loadNotes());
+
+  useEffect(() => saveNotes(notes), [notes]);
+
+  /* ----- fetch current-year room + progress + children ----- */
   useEffect(() => {
     if (!token) return;
-    setError('');
-
-    const headers = { authorization: `Bearer ${token}` };
 
     (async () => {
       try {
-        // Rooms (TFSA/RRSP room for the current year)
-        const r = await fetch('/api/rooms', { headers });
+        // Contribution room (TFSA / RRSP)
+        const r = await fetch('/api/rooms', {
+          headers: { authorization: `Bearer ${token}` },
+        });
         const rj = await r.json();
-        // Handle either {ok, room} or direct object/array
-        const room: Rooms | null =
-          rj?.room ??
-          (Array.isArray(rj) ? rj[0] : rj) ??
-          null;
-        setRooms(room);
+        if (rj?.ok && rj?.room?.year === year()) {
+          setRooms({ tfsa: Number(rj.room.tfsa || 0), rrsp: Number(rj.room.rrsp || 0), year: rj.room.year });
+        } else {
+          setRooms({ tfsa: 0, rrsp: 0, year: year() });
+        }
 
-        // Progress (what’s already deposited this year)
-        const p = await fetch('/api/rooms/progress', { headers });
+        // Deposited so far this year
+        const p = await fetch('/api/rooms/progress', {
+          headers: { authorization: `Bearer ${token}` },
+        });
         const pj = await p.json();
-        const prog: Progress | null = pj?.progress ?? pj ?? null;
-        setProgress(prog);
+        if (pj?.ok && pj?.progress?.year === year()) {
+          setProgress({
+            tfsa_deposited: Number(pj.progress.tfsa_deposited || 0),
+            rrsp_deposited: Number(pj.progress.rrsp_deposited || 0),
+            year: pj.progress.year,
+          });
+        } else {
+          setProgress({ tfsa_deposited: 0, rrsp_deposited: 0, year: year() });
+        }
 
         // Children
-        const c = await fetch('/api/children', { headers });
+        const c = await fetch('/api/children', { headers: { authorization: `Bearer ${token}` } });
         const cj = await c.json();
-        const kids: Child[] = cj?.children ?? cj ?? [];
-        setChildren(Array.isArray(kids) ? kids : []);
-
-        // Accounts (to check if RESP exists)
-        const a = await fetch('/api/accounts', { headers });
-        const aj = await a.json();
-        const accs: Account[] = aj?.accounts ?? aj ?? [];
-        setAccounts(Array.isArray(accs) ? accs : []);
-      } catch (e: any) {
-        setError(e?.message ?? 'Failed to load data.');
+        setChildren(Array.isArray(cj?.data) ? (cj.data as Child[]) : []);
+      } catch (e) {
+        // keep soft-failing
       }
     })();
   }, [token]);
 
-  // Core allocation logic
-  const recommendation = useMemo(() => {
-    const now = new Date();
-    const monthIdx = now.getMonth(); // 0..11
-    const monthsLeftRaw = 12 - monthIdx; // if July (6), this is 6 (Jul-Dec)
-    const monthsLeft = Math.max(1, monthsLeftRaw); // never 0 to avoid div by zero
-    const yearNow = now.getFullYear();
+  /* ----- allocation logic (RESP -> TFSA -> RRSP -> Margin) ----- */
 
-    const tfsaRoom = Number(rooms?.tfsa ?? 0);
-    const rrspRoom = Number(rooms?.rrsp ?? 0);
+  // remaining room for this year
+  const remaining = useMemo(() => {
+    const tfsaRoom = Math.max(0, (rooms?.tfsa || 0) - (progress?.tfsa_deposited || 0));
+    const rrspRoom = Math.max(0, (rooms?.rrsp || 0) - (progress?.rrsp_deposited || 0));
+    // For RESP, we cap at $2,500 per child per year to maximize grant (we don’t yet track “RESP contributed this year”, so assume 0 for now)
+    const respCap = (children?.length || 0) * 2500;
+    const respRemaining = Math.max(0, respCap); // assume not deposited yet; when you track RESP deposits, subtract them here.
+    return { tfsaRoom, rrspRoom, respRemaining };
+  }, [rooms, progress, children]);
 
-    const tfsaDeposited = Number(progress?.tfsa_deposited ?? 0);
-    const rrspDeposited = Number(progress?.rrsp_deposited ?? 0);
+  const monthsLeft = Math.max(1, monthsLeftThisYear()); // avoid divide-by-0; if Dec -> treat 1 month left
 
-    // Remaining room for THIS year
-    const tfsaRemaining = Math.max(0, tfsaRoom - tfsaDeposited);
-    const rrspRemaining = Math.max(0, rrspRoom - rrspDeposited);
+  const split = useMemo(() => {
+    let left = Math.max(0, pledge);
+    const out = { resp: 0, tfsa: 0, rrsp: 0, margin: 0 };
 
-    // Per-month targets to exactly use up room by year-end
-    const tfsaTargetPerMonth = tfsaRemaining / monthsLeft;
-    const rrspTargetPerMonth = rrspRemaining / monthsLeft;
-
-    // RESP: aim at $2,500/child/year to get full $500 grant
-    // We don’t yet track RESP_deposited YTD in progress; so we target “fresh”
-    // and let future versions subtract deposits once tracked.
-    const kidCount = children.length;
-    const hasRESPAccount = accounts.some(a => a.type === 'RESP');
-    const respTargetPerMonthPerChild = 2500 / monthsLeft;
-    const respTargetPerMonthTotal = kidCount > 0 ? respTargetPerMonthPerChild * kidCount : 0;
-
-    // Allocate monthly pledge by priority:
-    // 1) RESP to maximize grant
-    // 2) TFSA up to per-month target
-    // 3) RRSP up to per-month target
-    // 4) Remainder to Margin/Other
-    let remaining = monthlyPledge;
-    let toRESP = 0, toTFSA = 0, toRRSP = 0, toMargin = 0;
-
-    if (kidCount > 0 && hasRESPAccount) {
-      toRESP = Math.min(remaining, respTargetPerMonthTotal);
-      remaining -= toRESP;
+    // RESP first (only if there are children)
+    if (remaining.respRemaining > 0) {
+      const respPerMonth = Math.ceil(remaining.respRemaining / monthsLeft);
+      const alloc = Math.min(left, respPerMonth);
+      out.resp = alloc;
+      left -= alloc;
     }
 
-    if (tfsaTargetPerMonth > 0 && remaining > 0) {
-      toTFSA = Math.min(remaining, tfsaTargetPerMonth);
-      remaining -= toTFSA;
+    // TFSA next
+    if (remaining.tfsaRoom > 0 && left > 0) {
+      const tfsaPerMonth = Math.ceil(remaining.tfsaRoom / monthsLeft);
+      const alloc = Math.min(left, tfsaPerMonth);
+      out.tfsa = alloc;
+      left -= alloc;
     }
 
-    if (rrspTargetPerMonth > 0 && remaining > 0) {
-      toRRSP = Math.min(remaining, rrspTargetPerMonth);
-      remaining -= toRRSP;
+    // RRSP next
+    if (remaining.rrspRoom > 0 && left > 0) {
+      const rrspPerMonth = Math.ceil(remaining.rrspRoom / monthsLeft);
+      const alloc = Math.min(left, rrspPerMonth);
+      out.rrsp = alloc;
+      left -= alloc;
     }
 
-    toMargin = Math.max(0, remaining);
+    // Remainder to Margin/Other
+    out.margin = Math.max(0, left);
 
-    return {
-      labelMonthYear: monthYearLabel(now),
-      monthsLeft,
-      yearNow,
-      toRESP,
-      toTFSA,
-      toRRSP,
-      toMargin,
-      kidCount,
-      hasRESPAccount,
-      tfsaRemaining,
-      rrspRemaining,
+    return out;
+  }, [pledge, remaining, monthsLeft]);
+
+  /* ----- microphone (live) ----- */
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const SR: any = (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition;
+    if (!SR) return;
+
+    const rec: SpeechRecognition = new SR();
+    rec.lang = 'en-US';
+    rec.interimResults = true;
+    rec.continuous = true;
+
+    rec.onresult = (ev: SpeechRecognitionEvent) => {
+      let txt = '';
+      for (let i = ev.resultIndex; i < ev.results.length; i++) {
+        const res = ev.results[i];
+        const chunk = res[0]?.transcript ?? '';
+        // filter immediate duplicate short chunks that cause repeats
+        const last = lastChunkRef.current;
+        const nowT = Date.now();
+        if (chunk && !(chunk === last.text && nowT - last.at < 600)) {
+          txt += chunk;
+          lastChunkRef.current = { text: chunk, at: nowT };
+        }
+        if (res.isFinal) {
+          setLiveText((t) => (t.endsWith(' ') ? t : t + ' ') + chunk.trim() + ' ');
+        }
+      }
+      if (txt) {
+        // show interim quickly
+        setLiveText((t) => {
+          // don’t explode with whitespace repeats
+          const merged = (t + ' ' + txt).replace(/\s+/g, ' ');
+          return merged;
+        });
+      }
     };
-  }, [rooms, progress, children, accounts, monthlyPledge]);
 
-  if (loading) {
-    return (
-      <main className="max-w-6xl mx-auto p-4">
-        <div className="rounded-xl border bg-white p-6">Loading…</div>
-      </main>
-    );
-  }
+    rec.onerror = () => {
+      setRecognizing(false);
+      try {
+        rec.stop();
+      } catch {}
+      recogRef.current = null;
+    };
+    rec.onend = () => {
+      setRecognizing(false);
+      recogRef.current = null;
+    };
 
-  if (!session) {
-    return (
-      <main className="max-w-6xl mx-auto p-4">
-        <div className="rounded-xl border bg-white p-6">
-          Please sign in to set goals and see recommendations.
-        </div>
-      </main>
-    );
-  }
+    recogRef.current = rec;
+  }, []);
+
+  const toggleMic = () => {
+    const rec = recogRef.current as any;
+    if (!rec) return;
+    if (recognizing) {
+      try {
+        rec.stop();
+      } catch {}
+      setRecognizing(false);
+      return;
+    }
+    try {
+      lastChunkRef.current = { text: '', at: 0 };
+      rec.start();
+      setRecognizing(true);
+    } catch {}
+  };
+
+  const saveNote = () => {
+    const text = liveText.trim();
+    if (!text) return;
+    const note: GoalNote = { id: crypto.randomUUID(), ts: Date.now(), text };
+    setNotes((arr) => [note, ...arr]);
+    setLiveText('');
+  };
+  const deleteNote = (id: string) => {
+    setNotes((arr) => arr.filter((n) => n.id !== id));
+  };
+
+  /* ---------- UI ---------- */
+
+  const monthName = new Date(year(), monthIndex(), 1).toLocaleString(undefined, {
+    month: 'long',
+    year: 'numeric',
+  });
 
   return (
     <main className="max-w-6xl mx-auto p-4 space-y-4">
-      <div className="rounded-xl border bg-white p-4">
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-          <label className="text-sm font-medium">Monthly pledge</label>
-          <div className="flex items-center gap-3">
-            <span className="text-sm text-gray-600 min-w-[80px] text-right">
-              {CAD(monthlyPledge)}
-            </span>
-            <input
-              className="w-64 h-2 rounded-lg bg-gray-200 appearance-none accent-blue-600"
-              type="range"
-              min={0}
-              max={10000}
-              step={50}
-              value={monthlyPledge}
-              onChange={(e) => setMonthlyPledge(Math.round(+e.target.value / 50) * 50)}
-            />
+      {/* Pledge */}
+      <section className="rounded-2xl border bg-white p-4 shadow-sm">
+        <div className="text-sm font-medium mb-2">Monthly pledge</div>
+        <div className="flex items-center gap-4">
+          <div className="text-sm text-gray-700 min-w-[100px]">{CAD(pledge)}</div>
+          <input
+            className="w-full h-2 rounded-lg bg-gray-200 appearance-none accent-blue-600"
+            type="range"
+            min={0}
+            max={20000}
+            step={50}
+            value={pledge}
+            onChange={(e) => setPledge(clamp(Math.round(+e.target.value / 50) * 50, 0, 20000))}
+          />
+        </div>
+        <div className="mt-2 text-xs text-gray-600">
+          Recommendation is specific to {monthName} ({monthsLeft} {monthsLeft === 1 ? 'month' : 'months'} left this year).
+        </div>
+      </section>
+
+      {/* Suggested split cards (keep your old look) */}
+      <section className="rounded-2xl border bg-white p-4 shadow-sm">
+        <div className="text-sm font-medium mb-3">Suggested monthly split</div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-3">
+          {/* RESP card only if has children */}
+          {children.length > 0 && (
+            <div className="rounded-xl border p-4">
+              <div className="text-xs text-gray-500 mb-1">RESP</div>
+              <div className="text-2xl font-semibold">{CAD(split.resp)}</div>
+              <div className="text-xs text-gray-500 mt-1">
+                Remaining this year (cap): {CAD(remaining.respRemaining)}
+              </div>
+            </div>
+          )}
+
+          <div className="rounded-xl border p-4">
+            <div className="text-xs text-gray-500 mb-1">TFSA</div>
+            <div className="text-2xl font-semibold">{CAD(split.tfsa)}</div>
+            <div className="text-xs text-gray-500 mt-1">
+              Remaining room this year: {CAD(remaining.tfsaRoom)}
+            </div>
+          </div>
+
+          <div className="rounded-xl border p-4">
+            <div className="text-xs text-gray-500 mb-1">RRSP</div>
+            <div className="text-2xl font-semibold">{CAD(split.rrsp)}</div>
+            <div className="text-xs text-gray-500 mt-1">
+              Remaining room this year: {CAD(remaining.rrspRoom)}
+            </div>
+          </div>
+
+          <div className="rounded-xl border p-4">
+            <div className="text-xs text-gray-500 mb-1">Margin/Other</div>
+            <div className="text-2xl font-semibold">{CAD(split.margin)}</div>
           </div>
         </div>
-        <p className="text-xs text-gray-500 mt-2">
-          Recommendation is specific to {recommendation.labelMonthYear} ({recommendation.monthsLeft} month{recommendation.monthsLeft>1?'s':''} left this year).
-        </p>
-      </div>
 
-      {!!error && (
-        <div className="rounded-xl border bg-red-50 p-3 text-sm text-red-700">
-          {String(error)}
+        <div className="text-xs text-gray-600 mt-3">
+          Priority used: RESP (to maximize the 20% grant up to $500/child, $2,500 contribution per child/year) → TFSA → RRSP → remainder to
+          an unregistered account. Split uses months left in the year for per-month targets.
         </div>
-      )}
+      </section>
 
-      {recommendation.kidCount > 0 && !recommendation.hasRESPAccount && (
-        <div className="rounded-xl border bg-yellow-50 p-3 text-sm text-yellow-800">
-          You’ve added {recommendation.kidCount} child{recommendation.kidCount>1?'ren':''}, but no RESP account exists yet.
-          Add an RESP account on the <a className="underline" href="/accounts">Accounts</a> page to enable RESP contributions.
-        </div>
-      )}
+      {/* Mic + notes (as before) */}
+      <section className="rounded-2xl border bg-white p-4 shadow-sm">
+        <div className="text-sm font-medium mb-3">Describe your goals</div>
 
-      <section className="rounded-xl border bg-white p-4">
-        <div className="text-sm font-medium mb-2">Suggested monthly split for {recommendation.labelMonthYear}</div>
-        <ul className="text-sm space-y-1">
-          <li>RESP: <span className="font-medium">{CAD(Math.round(recommendation.toRESP))}</span></li>
-          <li>TFSA: <span className="font-medium">{CAD(Math.round(recommendation.toTFSA))}</span> <span className="text-gray-500">(remaining room this year: {CAD(Math.round(recommendation.tfsaRemaining))})</span></li>
-          <li>RRSP: <span className="font-medium">{CAD(Math.round(recommendation.toRRSP))}</span> <span className="text-gray-500">(remaining room this year: {CAD(Math.round(recommendation.rrspRemaining))})</span></li>
-          <li>Margin/Other: <span className="font-medium">{CAD(Math.round(recommendation.toMargin))}</span></li>
-        </ul>
-        <div className="text-xs text-gray-500 mt-2">
-          Order of priority used: RESP (to maximize the 20% grant up to $500/child), then TFSA, then RRSP; any remainder goes to an unregistered account.
+        <div className="flex items-center gap-3">
+          <button
+            onClick={toggleMic}
+            className={`rounded px-3 py-2 text-white ${recognizing ? 'bg-red-600' : 'bg-emerald-600'}`}
+          >
+            {recognizing ? 'Stop mic' : 'Start mic'}
+          </button>
+          <button onClick={saveNote} className="rounded bg-gray-900 px-3 py-2 text-white">
+            Save note
+          </button>
         </div>
+
+        <textarea
+          className="mt-3 w-full rounded-lg border p-3 min-h-[140px]"
+          placeholder="Speak or type your plan…"
+          value={liveText}
+          onChange={(e) => setLiveText(e.target.value)}
+        />
+
+        <div className="mt-2 text-xs text-gray-600">
+          Your microphone text appears live while you speak. Click “Save note” to keep a record below. (Notes are stored in your browser for
+          now.)
+        </div>
+      </section>
+
+      {/* Past Goals list (collapsible, delete) */}
+      <section className="rounded-2xl border bg-white p-4 shadow-sm">
+        <div className="text-sm font-medium mb-3">Past Goals</div>
+        {notes.length === 0 ? (
+          <div className="text-sm text-gray-600">No saved goals yet.</div>
+        ) : (
+          <ul className="divide-y">
+            {notes.map((n) => (
+              <PastNoteRow key={n.id} note={n} onDelete={() => deleteNote(n.id)} />
+            ))}
+          </ul>
+        )}
       </section>
     </main>
   );
+}
+
+/* ---------- small row component ---------- */
+
+function PastNoteRow({ note, onDelete }: { note: GoalNote; onDelete: () => void }) {
+  const [open, setOpen] = useState(false);
+  const when = new Date(note.ts).toLocaleString(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+
+  return (
+    <li className="py-2">
+      <div className="flex items-center justify-between">
+        <button onClick={() => setOpen((v) => !v)} className="text-left">
+          <div className="text-sm font-medium">{when}</div>
+          {open && <div className="mt-1 text-sm text-gray-700 whitespace-pre-wrap">{note.text}</div>}
+        </button>
+        <button onClick={onDelete} className="text-xs text-red-600 hover:underline">
+          Delete
+        </button>
+      </div>
+    </li>
+  );
+}
+
+/* ---------- SpeechRecognition typings (for TS) ---------- */
+/* These definitions allow TS to compile in the client bundle. */
+declare global {
+  interface Window {
+    webkitSpeechRecognition?: any;
+    SpeechRecognition?: any;
+  }
+  interface SpeechRecognition extends EventTarget {
+    lang: string;
+    interimResults: boolean;
+    continuous: boolean;
+    start: () => void;
+    stop: () => void;
+    onresult: (ev: SpeechRecognitionEvent) => void;
+    onerror: (ev: any) => void;
+    onend: () => void;
+  }
+  interface SpeechRecognitionEvent extends Event {
+    resultIndex: number;
+    results: SpeechRecognitionResultList;
+  }
+  interface SpeechRecognitionResultList {
+    length: number;
+    item: (index: number) => SpeechRecognitionResult;
+    [index: number]: SpeechRecognitionResult;
+  }
+  interface SpeechRecognitionResult {
+    isFinal: boolean;
+    length: number;
+    item: (index: number) => SpeechRecognitionAlternative;
+    [index: number]: SpeechRecognitionAlternative;
+  }
+  interface SpeechRecognitionAlternative {
+    transcript: string;
+    confidence: number;
+  }
 }
