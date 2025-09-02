@@ -1,263 +1,235 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useAuth } from '@/lib/auth';
 
-const CAD = (n:number)=>n.toLocaleString(undefined,{style:'currency',currency:'CAD',maximumFractionDigits:0});
+type Rooms = { year: number; tfsa: number; rrsp: number };
+type Progress = { year: number; tfsa_deposited?: number; rrsp_deposited?: number; resp_deposited?: number };
+type Child = { id: string; name: string; birth_year: number };
+type Account = { id: string; name: string; type: 'TFSA' | 'RRSP' | 'RESP' | 'Margin' | 'Other' | 'LIRA'; balance: number };
 
-// Types for Web Speech
-declare global {
-  interface Window {
-    webkitSpeechRecognition?: any;
-    SpeechRecognition?: any;
+const CAD = (n: number) =>
+  n.toLocaleString(undefined, { style: 'currency', currency: 'CAD', maximumFractionDigits: 0 });
+
+const monthYearLabel = (d = new Date()) =>
+  d.toLocaleString(undefined, { month: 'long', year: 'numeric' });
+
+/** Safe localStorage get (avoids SSR crashes) */
+function lsGetNumber(key: string, fallback: number) {
+  try {
+    if (typeof window === 'undefined') return fallback;
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return fallback;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : fallback;
+  } catch {
+    return fallback;
   }
 }
 
-type Rooms = { tfsa:number; rrsp:number };
-type Progress = { tfsa_deposited:number; rrsp_deposited:number };
-type Summary = { byType: Record<string, number> }; // from /api/summary
-
-export default function GoalsPage() {
-  const { session } = useAuth();
-  const token = session?.access_token ?? '';
-
-  // monthly pledge slider
-  const [pledge, setPledge] = useState<number>(1500);
-
-  // portfolio context
-  const [rooms, setRooms] = useState<Rooms>({ tfsa:0, rrsp:0 });
-  const [progress, setProgress] = useState<Progress>({ tfsa_deposited:0, rrsp_deposited:0 });
-  const [summary, setSummary] = useState<Summary|null>(null);
-
-  // mic / notes
-  const [note, setNote] = useState<string>('');
-  const [notes, setNotes] = useState<{id:string,ts:number,text:string}[]>([]);
-  const [micOn, setMicOn] = useState(false);
-  const recRef = useRef<any>(null);
-  const interimRef = useRef<string>('');       // live text shown
-  const lastFinalRef = useRef<string>('');     // prevent duplicates
-
-  // load context
-  useEffect(()=>{
-    if (!token) return;
-    (async ()=>{
-      const [r1, r2, r3] = await Promise.all([
-        fetch('/api/rooms', { headers:{ authorization:`Bearer ${token}` }}).then(r=>r.json()),
-        fetch('/api/rooms/progress', { headers:{ authorization:`Bearer ${token}` }}).then(r=>r.json()),
-        fetch('/api/summary', { headers:{ authorization:`Bearer ${token}` }}).then(r=>r.json()),
-      ]);
-      if (r1?.room) setRooms({ tfsa:Number(r1.room.tfsa||0), rrsp:Number(r1.room.rrsp||0) });
-      if (r2?.progress) setProgress({
-        tfsa_deposited:Number(r2.progress.tfsa_deposited||0),
-        rrsp_deposited:Number(r2.progress.rrsp_deposited||0),
-      });
-      if (r3?.ok) setSummary({ byType: r3.byType || {} });
-
-      // local notes
-      if (typeof window !== 'undefined') {
-        const raw = window.localStorage.getItem('goalNotes');
-        if (raw) {
-          try { setNotes(JSON.parse(raw)); } catch {}
-        }
-      }
-    })();
-  },[token]);
-
-  // RESP availability: only show if you have RESP account; otherwise, if user mentions “child”, show a nudge link
-  const hasRESPAccount = !!summary?.byType?.RESP;
-
-  // suggested split
-  const suggested = useMemo(()=>{
-    let rest = pledge;
-    let toRESP=0, toTFSA=0, toRRSP=0, toMargin=0;
-
-    // RESP first (only if the user actually has RESP account)
-    if (hasRESPAccount) {
-      // up to $2,500/year total cap
-      const cap = 2500;
-      const remaining = cap; // We could subtract deposited so far if you track RESP deposits; 0 for now
-      const perMonth = Math.ceil(remaining/12);
-      const amt = Math.max(0, Math.min(rest, perMonth));
-      toRESP += amt; rest -= amt;
-    }
-
-    // TFSA next up to available room
-    const tfsaLeft = Math.max(0, rooms.tfsa - progress.tfsa_deposited);
-    if (tfsaLeft > 0 && rest > 0) {
-      const perMonth = Math.ceil(tfsaLeft / 12);
-      const amt = Math.min(rest, perMonth);
-      toTFSA += amt; rest -= amt;
-    }
-
-    // RRSP next
-    const rrspLeft = Math.max(0, rooms.rrsp - progress.rrsp_deposited);
-    if (rrspLeft > 0 && rest > 0) {
-      const perMonth = Math.ceil(rrspLeft / 12);
-      const amt = Math.min(rest, perMonth);
-      toRRSP += amt; rest -= amt;
-    }
-
-    // remainder -> margin
-    toMargin = Math.max(0, rest);
-
-    return { toRESP, toTFSA, toRRSP, toMargin };
-  }, [pledge, rooms, progress, hasRESPAccount]);
-
-  // mic controls with interim text (prevents duplicates)
-  const startMic = ()=>{
+/** Safe localStorage set */
+function lsSetNumber(key: string, value: number) {
+  try {
     if (typeof window === 'undefined') return;
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) {
-      alert('Speech recognition not supported in this browser.');
-      return;
-    }
-    const rec = new SR();
-    rec.interimResults = true;
-    rec.continuous = true;
-    rec.maxAlternatives = 1;
-    rec.lang = 'en-US';
-
-    rec.onresult = (e:any)=>{
-      let finalChunk = '';
-      let interim = '';
-      for (let i=e.resultIndex; i<e.results.length; i++){
-        const res = e.results[i];
-        const txt = res[0]?.transcript ?? '';
-        if (res.isFinal) {
-          // avoid duplicate final segments
-          if (txt && txt !== lastFinalRef.current) {
-            finalChunk += (finalChunk ? ' ' : '') + txt;
-            lastFinalRef.current = txt;
-          }
-        } else {
-          interim += (interim ? ' ' : '') + txt;
-        }
-      }
-      if (finalChunk) setNote(prev => (prev ? prev + ' ' : '') + finalChunk);
-      interimRef.current = interim;
-      // show interim live by forcing a state update via trailing space trick
-      setNote(prev => prev); // render
-    };
-
-    rec.onerror = ()=>{};
-    rec.onend = ()=> setMicOn(false);
-
-    rec.start();
-    recRef.current = rec;
-    setMicOn(true);
-  };
-
-  const stopMic = ()=>{
-    recRef.current?.stop?.();
-    setMicOn(false);
-    interimRef.current = '';
-  };
-
-  const onSaveNote = ()=>{
-    const text = (note + (interimRef.current ? (' ' + interimRef.current) : '')).trim();
-    if (!text) return;
-    const item = { id: String(Date.now()), ts: Date.now(), text };
-    const next = [item, ...notes];
-    setNotes(next);
-    setNote('');
-    interimRef.current = '';
-    lastFinalRef.current = '';
-    if (typeof window !== 'undefined') {
-      window.localStorage.setItem('goalNotes', JSON.stringify(next));
-    }
-  };
-
-  const onDeleteNote = (id:string)=>{
-    const next = notes.filter(n=>n.id !== id);
-    setNotes(next);
-    if (typeof window !== 'undefined') {
-      window.localStorage.setItem('goalNotes', JSON.stringify(next));
-    }
-  };
-
-  const showsChildNudge = !hasRESPAccount && /\b(child|children|kid|kids|RESP)\b/i.test(note || notes[0]?.text || '');
-
-  return (
-    <main className="max-w-5xl mx-auto p-4 space-y-6">
-
-      {/* Monthly pledge + split */}
-      <section className="rounded-2xl border bg-white p-4">
-        <div className="text-sm font-medium mb-3">Monthly pledge</div>
-        <input type="range" min={0} max={10000} step={50}
-               value={pledge} onChange={e=>setPledge(+e.target.value)} className="w-full"/>
-        <div className="mt-2 text-sm text-gray-700">{CAD(pledge)}</div>
-
-        <div className="mt-4 grid grid-cols-1 md:grid-cols-4 gap-3">
-          {hasRESPAccount && (
-            <KPI title="RESP" value={CAD(suggested.toRESP)}/>
-          )}
-          <KPI title="TFSA" value={CAD(suggested.toTFSA)}/>
-          <KPI title="RRSP" value={CAD(suggested.toRRSP)}/>
-          <KPI title="Margin/Other" value={CAD(suggested.toMargin)}/>
-        </div>
-
-        <div className="mt-2 text-xs text-gray-600">
-          Priorities: RESP up to $2,500 per child per year → TFSA to available room → RRSP to available room → remainder to Margin/Other.
-          {showsChildNudge && (
-            <span className="ml-2">
-              Mentioned children but no RESP account yet. <a href="/accounts" className="underline">Add RESP</a>
-            </span>
-          )}
-        </div>
-      </section>
-
-      {/* Describe your goals (mic) */}
-      <section className="rounded-2xl border bg-white p-4">
-        <div className="text-sm font-medium mb-3">Describe your goals</div>
-        <div className="flex gap-2 mb-2">
-          {!micOn ? (
-            <button onClick={startMic} className="rounded-lg bg-emerald-600 text-white px-3 py-2">Start mic</button>
-          ) : (
-            <button onClick={stopMic} className="rounded-lg bg-rose-600 text-white px-3 py-2">Stop</button>
-          )}
-          <button onClick={onSaveNote} className="rounded-lg border px-3 py-2">Save note</button>
-        </div>
-        <textarea
-          className="w-full min-h-[140px] border rounded-lg px-3 py-2"
-          placeholder="Speak or type your plan…"
-          value={note + (interimRef.current ? (' ' + interimRef.current) : '')}
-          onChange={e=>{ setNote(e.target.value); interimRef.current=''; }}
-        />
-        <div className="mt-1 text-xs text-gray-500">
-          Your microphone text appears live while you speak. Click “Save note” to keep a record below. (Notes are stored in your browser for now.)
-        </div>
-      </section>
-
-      {/* Past goals */}
-      <section className="rounded-2xl border bg-white p-4">
-        <div className="text-sm font-medium mb-3">Past Goals</div>
-        {notes.length === 0 ? (
-          <div className="text-sm text-gray-500">No saved goals yet.</div>
-        ) : (
-          <ul className="divide-y">
-            {notes.map(n=>(
-              <li key={n.id} className="py-3 flex items-center justify-between">
-                <details className="w-full mr-3">
-                  <summary className="cursor-pointer text-sm">
-                    {new Date(n.ts).toLocaleString()}
-                  </summary>
-                  <div className="mt-2 text-sm text-gray-700 whitespace-pre-wrap">{n.text}</div>
-                </details>
-                <button onClick={()=>onDeleteNote(n.id)} className="text-rose-600 text-sm">Delete</button>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
-    </main>
-  );
+    window.localStorage.setItem(key, String(value));
+  } catch {}
 }
 
-function KPI({ title, value }:{title:string,value:string}) {
+export default function GoalsPage() {
+  const { session, loading } = useAuth();
+  const token = session?.access_token ?? '';
+
+  // Persisted pledge slider (defaults: $1000 & 10% — you can show/use rate later if you like)
+  const [monthlyPledge, setMonthlyPledge] = useState<number>(() => lsGetNumber('goals_pledge', 1000));
+  useEffect(() => { lsSetNumber('goals_pledge', monthlyPledge); }, [monthlyPledge]);
+
+  // Data we need to compute the split
+  const [rooms, setRooms] = useState<Rooms | null>(null);
+  const [progress, setProgress] = useState<Progress | null>(null);
+  const [children, setChildren] = useState<Child[]>([]);
+  const [accounts, setAccounts] = useState<Account[]>([]);
+  const [error, setError] = useState<string>('');
+
+  // Fetch everything when signed in
+  useEffect(() => {
+    if (!token) return;
+    setError('');
+
+    const headers = { authorization: `Bearer ${token}` };
+
+    (async () => {
+      try {
+        // Rooms (TFSA/RRSP room for the current year)
+        const r = await fetch('/api/rooms', { headers });
+        const rj = await r.json();
+        // Handle either {ok, room} or direct object/array
+        const room: Rooms | null =
+          rj?.room ??
+          (Array.isArray(rj) ? rj[0] : rj) ??
+          null;
+        setRooms(room);
+
+        // Progress (what’s already deposited this year)
+        const p = await fetch('/api/rooms/progress', { headers });
+        const pj = await p.json();
+        const prog: Progress | null = pj?.progress ?? pj ?? null;
+        setProgress(prog);
+
+        // Children
+        const c = await fetch('/api/children', { headers });
+        const cj = await c.json();
+        const kids: Child[] = cj?.children ?? cj ?? [];
+        setChildren(Array.isArray(kids) ? kids : []);
+
+        // Accounts (to check if RESP exists)
+        const a = await fetch('/api/accounts', { headers });
+        const aj = await a.json();
+        const accs: Account[] = aj?.accounts ?? aj ?? [];
+        setAccounts(Array.isArray(accs) ? accs : []);
+      } catch (e: any) {
+        setError(e?.message ?? 'Failed to load data.');
+      }
+    })();
+  }, [token]);
+
+  // Core allocation logic
+  const recommendation = useMemo(() => {
+    const now = new Date();
+    const monthIdx = now.getMonth(); // 0..11
+    const monthsLeftRaw = 12 - monthIdx; // if July (6), this is 6 (Jul-Dec)
+    const monthsLeft = Math.max(1, monthsLeftRaw); // never 0 to avoid div by zero
+    const yearNow = now.getFullYear();
+
+    const tfsaRoom = Number(rooms?.tfsa ?? 0);
+    const rrspRoom = Number(rooms?.rrsp ?? 0);
+
+    const tfsaDeposited = Number(progress?.tfsa_deposited ?? 0);
+    const rrspDeposited = Number(progress?.rrsp_deposited ?? 0);
+
+    // Remaining room for THIS year
+    const tfsaRemaining = Math.max(0, tfsaRoom - tfsaDeposited);
+    const rrspRemaining = Math.max(0, rrspRoom - rrspDeposited);
+
+    // Per-month targets to exactly use up room by year-end
+    const tfsaTargetPerMonth = tfsaRemaining / monthsLeft;
+    const rrspTargetPerMonth = rrspRemaining / monthsLeft;
+
+    // RESP: aim at $2,500/child/year to get full $500 grant
+    // We don’t yet track RESP_deposited YTD in progress; so we target “fresh”
+    // and let future versions subtract deposits once tracked.
+    const kidCount = children.length;
+    const hasRESPAccount = accounts.some(a => a.type === 'RESP');
+    const respTargetPerMonthPerChild = 2500 / monthsLeft;
+    const respTargetPerMonthTotal = kidCount > 0 ? respTargetPerMonthPerChild * kidCount : 0;
+
+    // Allocate monthly pledge by priority:
+    // 1) RESP to maximize grant
+    // 2) TFSA up to per-month target
+    // 3) RRSP up to per-month target
+    // 4) Remainder to Margin/Other
+    let remaining = monthlyPledge;
+    let toRESP = 0, toTFSA = 0, toRRSP = 0, toMargin = 0;
+
+    if (kidCount > 0 && hasRESPAccount) {
+      toRESP = Math.min(remaining, respTargetPerMonthTotal);
+      remaining -= toRESP;
+    }
+
+    if (tfsaTargetPerMonth > 0 && remaining > 0) {
+      toTFSA = Math.min(remaining, tfsaTargetPerMonth);
+      remaining -= toTFSA;
+    }
+
+    if (rrspTargetPerMonth > 0 && remaining > 0) {
+      toRRSP = Math.min(remaining, rrspTargetPerMonth);
+      remaining -= toRRSP;
+    }
+
+    toMargin = Math.max(0, remaining);
+
+    return {
+      labelMonthYear: monthYearLabel(now),
+      monthsLeft,
+      yearNow,
+      toRESP,
+      toTFSA,
+      toRRSP,
+      toMargin,
+      kidCount,
+      hasRESPAccount,
+      tfsaRemaining,
+      rrspRemaining,
+    };
+  }, [rooms, progress, children, accounts, monthlyPledge]);
+
+  if (loading) {
+    return (
+      <main className="max-w-6xl mx-auto p-4">
+        <div className="rounded-xl border bg-white p-6">Loading…</div>
+      </main>
+    );
+  }
+
+  if (!session) {
+    return (
+      <main className="max-w-6xl mx-auto p-4">
+        <div className="rounded-xl border bg-white p-6">
+          Please sign in to set goals and see recommendations.
+        </div>
+      </main>
+    );
+  }
+
   return (
-    <div className="rounded-lg border p-3">
-      <div className="text-xs text-gray-600">{title}</div>
-      <div className="text-lg font-semibold">{value}</div>
-    </div>
+    <main className="max-w-6xl mx-auto p-4 space-y-4">
+      <div className="rounded-xl border bg-white p-4">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <label className="text-sm font-medium">Monthly pledge</label>
+          <div className="flex items-center gap-3">
+            <span className="text-sm text-gray-600 min-w-[80px] text-right">
+              {CAD(monthlyPledge)}
+            </span>
+            <input
+              className="w-64 h-2 rounded-lg bg-gray-200 appearance-none accent-blue-600"
+              type="range"
+              min={0}
+              max={10000}
+              step={50}
+              value={monthlyPledge}
+              onChange={(e) => setMonthlyPledge(Math.round(+e.target.value / 50) * 50)}
+            />
+          </div>
+        </div>
+        <p className="text-xs text-gray-500 mt-2">
+          Recommendation is specific to {recommendation.labelMonthYear} ({recommendation.monthsLeft} month{recommendation.monthsLeft>1?'s':''} left this year).
+        </p>
+      </div>
+
+      {!!error && (
+        <div className="rounded-xl border bg-red-50 p-3 text-sm text-red-700">
+          {String(error)}
+        </div>
+      )}
+
+      {recommendation.kidCount > 0 && !recommendation.hasRESPAccount && (
+        <div className="rounded-xl border bg-yellow-50 p-3 text-sm text-yellow-800">
+          You’ve added {recommendation.kidCount} child{recommendation.kidCount>1?'ren':''}, but no RESP account exists yet.
+          Add an RESP account on the <a className="underline" href="/accounts">Accounts</a> page to enable RESP contributions.
+        </div>
+      )}
+
+      <section className="rounded-xl border bg-white p-4">
+        <div className="text-sm font-medium mb-2">Suggested monthly split for {recommendation.labelMonthYear}</div>
+        <ul className="text-sm space-y-1">
+          <li>RESP: <span className="font-medium">{CAD(Math.round(recommendation.toRESP))}</span></li>
+          <li>TFSA: <span className="font-medium">{CAD(Math.round(recommendation.toTFSA))}</span> <span className="text-gray-500">(remaining room this year: {CAD(Math.round(recommendation.tfsaRemaining))})</span></li>
+          <li>RRSP: <span className="font-medium">{CAD(Math.round(recommendation.toRRSP))}</span> <span className="text-gray-500">(remaining room this year: {CAD(Math.round(recommendation.rrspRemaining))})</span></li>
+          <li>Margin/Other: <span className="font-medium">{CAD(Math.round(recommendation.toMargin))}</span></li>
+        </ul>
+        <div className="text-xs text-gray-500 mt-2">
+          Order of priority used: RESP (to maximize the 20% grant up to $500/child), then TFSA, then RRSP; any remainder goes to an unregistered account.
+        </div>
+      </section>
+    </main>
   );
 }
