@@ -1,10 +1,11 @@
 'use client';
 
-/* Goals page — restored original UI + mic/notes + months-left math
-   - Monthly pledge slider persists between sessions
-   - Recommendation explicitly depends on “months left this year”
-   - Priority: RESP (up to $2,500/child/year after deposits) → TFSA room → RRSP room → remainder = Margin/Other
-   - Mic: live, low-lag interim text; “Save note” appends to Past Goals with delete; all stored locally
+/* Goals page — original UI + mic icon + robust months-left split
+   - Tries /api/rooms?year=YYYY and /api/rooms (fallback)
+   - Tries /api/rooms/progress?year=YYYY and /api/rooms/progress (fallback)
+   - Also fetches /api/children and /api/accounts to decide RESP tile visibility
+   - Priority: RESP (only if user has a child) → TFSA → RRSP → remainder to Margin
+   - Slider value persists between sessions (defaults: CA$1,000; first run)
 */
 
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -18,20 +19,25 @@ const CAD = (n: number) =>
     maximumFractionDigits: 0,
   });
 
-const today = () => new Date();
-const yearNow = () => today().getFullYear();
+const now = () => new Date();
+const currentYear = () => now().getFullYear();
 
-/** Months left INCLUSIVE of the current month (ex: Sept → 4: Sep, Oct, Nov, Dec). */
-function monthsLeftThisYear(d = today()) {
-  const m = d.getMonth(); // 0..11
-  return Math.max(1, 12 - m);
+/** Months left INCLUSIVE of this month (Sep → 4: Sep, Oct, Nov, Dec). */
+function monthsLeftThisYear(d = now()) {
+  return Math.max(1, 12 - d.getMonth());
 }
 
 type Rooms = { tfsa: number; rrsp: number; year: number };
-type Progress = { tfsa_deposited?: number; rrsp_deposited?: number; resp_deposited?: number; year: number };
+type Progress = {
+  tfsa_deposited?: number;
+  rrsp_deposited?: number;
+  resp_deposited?: number;
+  year: number;
+};
 type Child = { id: string; name: string; birth_year: number };
+type Account = { id: string; type: string; name?: string; balance?: number };
 
-// LocalStorage safe helpers
+// localStorage (safe)
 function loadLS<T>(k: string, fallback: T): T {
   if (typeof window === 'undefined') return fallback;
   try {
@@ -47,12 +53,26 @@ function saveLS<T>(k: string, v: T) {
   } catch {}
 }
 
+async function fetchJson(url: string, headers: Record<string, string>) {
+  try {
+    const r = await fetch(url, { headers });
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
+
+function num(x: any) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : 0;
+}
+
 // ---------- page ----------
 export default function GoalsPage() {
   const { session } = useAuth();
   const token = session?.access_token ?? '';
 
-  // pledge slider (persist)
+  // pledge slider (persist; default CA$1,000 for first-time users)
   const [pledge, setPledge] = useState<number>(() => loadLS('goals.pledge', 1000));
   useEffect(() => saveLS('goals.pledge', pledge), [pledge]);
 
@@ -60,6 +80,7 @@ export default function GoalsPage() {
   const [rooms, setRooms] = useState<Rooms | null>(null);
   const [progress, setProgress] = useState<Progress | null>(null);
   const [children, setChildren] = useState<Child[]>([]);
+  const [hasRespAccount, setHasRespAccount] = useState(false);
 
   // mic + notes
   const [isMicOn, setIsMicOn] = useState(false);
@@ -69,114 +90,118 @@ export default function GoalsPage() {
   );
   useEffect(() => saveLS('goals.notes', notes), [notes]);
 
-  // fetch current-year room + progress + children (after login)
+  // fetch current-year room / progress / children / accounts
   useEffect(() => {
     if (!token) return;
-    const hdrs = { authorization: `Bearer ${token}` };
+    const headers = { authorization: `Bearer ${token}` };
+    const yr = currentYear();
 
     (async () => {
-      try {
-        // contribution room (current year)
-        const yr = yearNow();
-        const r = await fetch('/api/rooms?year=' + yr, { headers: hdrs });
-        const roomJ = await r.json();
-        if (roomJ?.ok) {
-          setRooms({
-            tfsa: Number(roomJ.tfsa ?? 0),
-            rrsp: Number(roomJ.rrsp ?? 0),
-            year: yr,
-          });
-        }
+      // ----- contribution rooms -----
+      let roomJ =
+        (await fetchJson(`/api/rooms?year=${yr}`, headers)) ??
+        (await fetchJson(`/api/rooms`, headers));
+      if (roomJ && roomJ.ok !== false) {
+        // tolerate different shapes
+        const tfsa = num(roomJ.tfsa ?? roomJ?.data?.tfsa);
+        const rrsp = num(roomJ.rrsp ?? roomJ?.data?.rrsp);
+        setRooms({ tfsa, rrsp, year: yr });
+      } else {
+        setRooms({ tfsa: 0, rrsp: 0, year: yr });
+      }
 
-        // deposited so far this year (tfsa/rrsp/resp if available)
-        const p = await fetch('/api/rooms/progress?year=' + yr, { headers: hdrs });
-        const progJ = await p.json();
-        if (progJ?.ok) {
-          setProgress({
-            tfsa_deposited: Number(progJ.tfsa_deposited ?? 0),
-            rrsp_deposited: Number(progJ.rrsp_deposited ?? 0),
-            resp_deposited: Number(progJ.resp_deposited ?? 0),
-            year: yr,
-          });
-        }
+      // ----- deposited so far -----
+      let progJ =
+        (await fetchJson(`/api/rooms/progress?year=${yr}`, headers)) ??
+        (await fetchJson(`/api/rooms/progress`, headers));
+      if (progJ && progJ.ok !== false) {
+        setProgress({
+          tfsa_deposited: num(progJ.tfsa_deposited),
+          rrsp_deposited: num(progJ.rrsp_deposited),
+          resp_deposited: num(progJ.resp_deposited),
+          year: yr,
+        });
+      } else {
+        setProgress({ tfsa_deposited: 0, rrsp_deposited: 0, resp_deposited: 0, year: yr });
+      }
 
-        // children
-        const c = await fetch('/api/children', { headers: hdrs });
-        const cJ = await c.json();
-        if (cJ?.ok && Array.isArray(cJ.items)) setChildren(cJ.items as Child[]);
-      } catch {
-        // swallow — show zeros
+      // ----- children -----
+      const childrenJ = await fetchJson(`/api/children`, headers);
+      if (childrenJ?.ok && Array.isArray(childrenJ.items)) setChildren(childrenJ.items);
+
+      // ----- accounts (for RESP tile visibility even if no child yet) -----
+      const accountsJ = await fetchJson(`/api/accounts`, headers);
+      if (accountsJ?.ok && Array.isArray(accountsJ.items)) {
+        const items = accountsJ.items as Account[];
+        setHasRespAccount(items.some((a) => String(a.type).toUpperCase() === 'RESP'));
       }
     })();
   }, [token]);
 
-  // months left and remaining rooms
   const monthsLeft = monthsLeftThisYear();
   const childCount = children?.length ?? 0;
 
+  // compute remaining rooms (room - deposited)
   const remaining = useMemo(() => {
-    const tfsaRoom = Math.max(0, Number(rooms?.tfsa ?? 0));
-    const rrspRoom = Math.max(0, Number(rooms?.rrsp ?? 0));
-    const tfsaDep = Math.max(0, Number(progress?.tfsa_deposited ?? 0));
-    const rrspDep = Math.max(0, Number(progress?.rrsp_deposited ?? 0));
-    const respDep = Math.max(0, Number(progress?.resp_deposited ?? 0));
-    // RESP target cap = $2,500 per child per year (for CESG max)
+    const tfsaRoom = num(rooms?.tfsa);
+    const rrspRoom = num(rooms?.rrsp);
+    const tfsaDep = num(progress?.tfsa_deposited);
+    const rrspDep = num(progress?.rrsp_deposited);
+    const respDep = num(progress?.resp_deposited);
+
+    // RESP target = $2,500 per child per year (grant max)
     const respTarget = childCount * 2500;
     const respRem = Math.max(0, respTarget - respDep);
 
     return {
       tfsa: Math.max(0, tfsaRoom - tfsaDep),
       rrsp: Math.max(0, rrspRoom - rrspDep),
-      resp: respRem,
+      resp: respRem, // 0 if no child
     };
   }, [rooms, progress, childCount]);
 
-  // priority allocation function
+  // priority allocation for this month
   const split = useMemo(() => {
-    let remainingMonthly = pledge;
+    let left = pledge;
     const out = { resp: 0, tfsa: 0, rrsp: 0, margin: 0 };
 
-    // helper: per-month cap based on months left
-    const capPerMonth = (room: number) => {
-      // If user wants less than "catch-up per month", they’ll just partially fill;
-      // we cap the *recommended* at room / monthsLeft
-      return Math.ceil(room / monthsLeft);
-    };
+    // helper: max to contribute this month to fully use room by year-end
+    const capPerMonth = (room: number) => Math.ceil(room / monthsLeft);
 
-    // 1) RESP first (only if childCount > 0)
-    if (childCount > 0 && remaining.resp > 0) {
+    // 1) RESP only if user has a child (priority rule)
+    if (childCount > 0 && remaining.resp > 0 && left > 0) {
       const cap = capPerMonth(remaining.resp);
-      const amt = Math.min(remainingMonthly, cap);
+      const amt = Math.min(left, cap);
       out.resp = amt;
-      remainingMonthly -= amt;
+      left -= amt;
     }
 
     // 2) TFSA
-    if (remainingMonthly > 0 && remaining.tfsa > 0) {
+    if (remaining.tfsa > 0 && left > 0) {
       const cap = capPerMonth(remaining.tfsa);
-      const amt = Math.min(remainingMonthly, cap);
+      const amt = Math.min(left, cap);
       out.tfsa = amt;
-      remainingMonthly -= amt;
+      left -= amt;
     }
 
     // 3) RRSP
-    if (remainingMonthly > 0 && remaining.rrsp > 0) {
+    if (remaining.rrsp > 0 && left > 0) {
       const cap = capPerMonth(remaining.rrsp);
-      const amt = Math.min(remainingMonthly, cap);
+      const amt = Math.min(left, cap);
       out.rrsp = amt;
-      remainingMonthly -= amt;
+      left -= amt;
     }
 
-    // 4) remainder → Margin/Other
-    if (remainingMonthly > 0) out.margin = remainingMonthly;
+    // 4) remainder
+    if (left > 0) out.margin = left;
 
     return out;
   }, [pledge, monthsLeft, remaining, childCount]);
 
-  // ---------- mic (SpeechRecognition) ----------
+  // ---------- mic (icon) ----------
   const recRef = useRef<SpeechRecognition | null>(null);
-  const interimRef = useRef(''); // to reduce duplication flicker
-  const lastFinalRef = useRef(''); // de-dup final
+  const interimRef = useRef('');
+  const lastFinalRef = useRef('');
 
   const startMic = () => {
     if (typeof window === 'undefined') return;
@@ -201,22 +226,16 @@ export default function GoalsPage() {
         if (res.isFinal) finalChunk += t;
         else interimChunk += t;
       }
-
-      // Deduplicate finals
       if (finalChunk && finalChunk !== lastFinalRef.current) {
         lastFinalRef.current = finalChunk;
         setText((prev) => (prev + ' ' + finalChunk).trim());
         interimRef.current = '';
       }
-
-      // Show interims live but don’t repeat
       if (interimChunk && interimChunk !== interimRef.current) {
         interimRef.current = interimChunk;
-        // Render combined
         setText((prev) => (prev + ' ' + interimChunk).trim());
       }
     };
-
     rec.onerror = () => stopMic();
     rec.onend = () => setIsMicOn(false);
 
@@ -231,28 +250,27 @@ export default function GoalsPage() {
     } catch {}
     recRef.current = null;
     setIsMicOn(false);
-    // clear dangling interim
     interimRef.current = '';
   };
 
   const toggleMic = () => (isMicOn ? stopMic() : startMic());
 
-  // save a note
+  // notes
   const saveNote = () => {
     const t = text.trim();
     if (!t) return;
-    const id = cryptoRandomId();
+    const id = cryptoId();
     const ts = new Date().toISOString();
     setNotes((arr) => [{ id, ts, text: t }, ...arr]);
     setText('');
     lastFinalRef.current = '';
     interimRef.current = '';
   };
+  const deleteNote = (id: string) => setNotes((arr) => arr.filter((n) => n.id !== id));
 
-  const deleteNote = (id: string) =>
-    setNotes((arr) => arr.filter((n) => n.id !== id));
+  // RESP tile visible: child OR RESP account present
+  const showRespTile = childCount > 0 || hasRespAccount;
 
-  // ---------- UI ----------
   return (
     <main className="max-w-6xl mx-auto p-4 space-y-4">
       {/* Monthly pledge */}
@@ -277,7 +295,7 @@ export default function GoalsPage() {
         </div>
       </section>
 
-      {/* Recommendation tiles (original compact style) */}
+      {/* Recommendation tiles (original style) */}
       <section className="rounded-2xl border bg-white p-4 shadow-sm">
         <div className="text-sm font-medium mb-3">
           Suggested monthly split for{' '}
@@ -285,13 +303,17 @@ export default function GoalsPage() {
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-4 gap-3">
-          {/* RESP only if user has children */}
-          {childCount > 0 && (
+          {showRespTile && (
             <div className="rounded-xl border p-4">
               <div className="text-xs text-gray-600 mb-1">RESP</div>
               <div className="text-2xl font-semibold">{CAD(split.resp)}</div>
               <div className="text-[11px] text-gray-500 mt-1">
                 Remaining this year: {CAD(remaining.resp)}
+                {childCount === 0 && hasRespAccount && (
+                  <span className="ml-1 text-[11px] text-amber-600">
+                    (add a child to prioritize RESP)
+                  </span>
+                )}
               </div>
             </div>
           )}
@@ -319,30 +341,43 @@ export default function GoalsPage() {
         </div>
 
         <div className="text-xs text-gray-500 mt-3">
-          Order of priority: RESP (to maximize the 20% grant up to $500/child), then TFSA
-          to available room, then RRSP to available room; any remainder goes to an
-          unregistered account. Calculations prorate room by{' '}
+          Order of priority: RESP (only when you have a child) → TFSA to available room → RRSP to
+          available room → remainder to an unregistered account. Calculations prorate by{' '}
           <span className="font-medium">{monthsLeft}</span> months left this year.
         </div>
       </section>
 
-      {/* Mic + notes (original section) */}
+      {/* Mic + notes (original section, with MIC ICON toggle) */}
       <section className="rounded-2xl border bg-white p-4 shadow-sm">
         <div className="text-sm font-medium mb-3">Describe your goals</div>
 
         <div className="flex items-center gap-2 mb-3">
           <button
             onClick={toggleMic}
-            className={`rounded px-3 py-2 text-white ${
-              isMicOn ? 'bg-red-600' : 'bg-emerald-600'
-            }`}
+            aria-label={isMicOn ? 'Stop microphone' : 'Start microphone'}
+            title={isMicOn ? 'Stop microphone' : 'Start microphone'}
+            className={`rounded p-2 ${isMicOn ? 'bg-red-600' : 'bg-emerald-600'} text-white`}
           >
-            {isMicOn ? 'Stop mic' : 'Start mic'}
+            {/* mic icon */}
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path
+                d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Z"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+              <path
+                d="M19 11a7 7 0 0 1-14 0M12 18v3"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
           </button>
-          <button
-            onClick={saveNote}
-            className="rounded bg-indigo-600 px-3 py-2 text-white"
-          >
+
+          <button onClick={saveNote} className="rounded bg-indigo-600 px-3 py-2 text-white">
             Save note
           </button>
         </div>
@@ -355,12 +390,12 @@ export default function GoalsPage() {
         />
 
         <div className="mt-2 text-xs text-gray-500">
-          Your microphone text appears live while you speak. Click “Save note” to keep a
-          record below. (Notes are stored in your browser for now.)
+          Your microphone text appears live while you speak. Click “Save note” to keep a record
+          below. (Notes are stored in your browser for now.)
         </div>
       </section>
 
-      {/* Past Goals (collapsible items with delete) */}
+      {/* Past Goals list (collapsible) */}
       <section className="rounded-2xl border bg-white p-4 shadow-sm">
         <div className="text-sm font-medium mb-3">Past Goals</div>
 
@@ -388,9 +423,7 @@ export default function GoalsPage() {
                   </button>
                 </div>
                 <details className="mt-2">
-                  <summary className="cursor-pointer text-xs text-gray-600">
-                    Show note
-                  </summary>
+                  <summary className="cursor-pointer text-xs text-gray-600">Show note</summary>
                   <div className="mt-2 whitespace-pre-wrap text-sm">{n.text}</div>
                 </details>
               </li>
@@ -403,19 +436,19 @@ export default function GoalsPage() {
 }
 
 // ---------- tiny utils ----------
-function cryptoRandomId() {
+function cryptoId() {
   if (typeof crypto !== 'undefined' && (crypto as any).randomUUID) {
     return (crypto as any).randomUUID();
   }
   return 'id-' + Math.random().toString(36).slice(2);
 }
 
-/* ---------- SpeechRecognition typings (safe shim to avoid DOM lib conflicts) ---------- */
+/* ---------- SpeechRecognition typings (safe shim) ---------- */
 declare global {
   interface Window {
     webkitSpeechRecognition?: any;
     SpeechRecognition?: any;
   }
 }
-// Treat SR types as 'any' to avoid declaration-merge conflicts with lib.dom
+// Avoid conflicts with lib.dom — treat as 'any'
 type SpeechRecognition = any;
