@@ -3,10 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useAuth } from '@/lib/auth';
 
-// ===== visible tag so we can confirm the file version is live =====
-const FILE_TAG = 'GOALS_DIAG_V1';
-
-// ---- helpers ----
+/* ===== Helpers ===== */
 const CAD = (n: number) =>
   n.toLocaleString(undefined, { style: 'currency', currency: 'CAD', maximumFractionDigits: 0 });
 
@@ -16,9 +13,13 @@ const monthsLeftThisYear = () => Math.max(1, 12 - now().getMonth());
 
 type Rooms = { tfsa: number; rrsp: number; year: number };
 type Progress = { tfsa_deposited?: number; rrsp_deposited?: number; resp_deposited?: number; year: number };
-type Child = { id: string; name: string };
-type Account = { id: string; type: string; name?: string; balance?: number };
+type Child = { id: string; name: string; [k: string]: any };
+type Account = { id: string; type: string; name?: string; balance?: number; [k: string]: any };
 
+function num(x: any) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : 0;
+}
 function loadLS<T>(k: string, fallback: T): T {
   if (typeof window === 'undefined') return fallback;
   try {
@@ -29,35 +30,72 @@ function loadLS<T>(k: string, fallback: T): T {
   }
 }
 function saveLS<T>(k: string, v: T) {
-  try { if (typeof window !== 'undefined') window.localStorage.setItem(k, JSON.stringify(v)); } catch {}
-}
-const num = (x: any) => (Number.isFinite(Number(x)) ? Number(x) : 0);
-
-async function fetchJson(url: string, headers: Record<string, string>) {
   try {
-    const r = await fetch(url, { headers });
+    if (typeof window !== 'undefined') window.localStorage.setItem(k, JSON.stringify(v));
+  } catch {}
+}
+async function getJson(url: string, headers: Record<string, string>) {
+  try {
+    const r = await fetch(url, { headers, cache: 'no-store' });
     return await r.json();
-  } catch (e) {
-    console.error('fetchJson error', url, e);
+  } catch {
     return null;
   }
 }
 
+/* ===== Robust parsers for many possible response shapes ===== */
+function parseRooms(j: any, year: number): Rooms {
+  // Accept a bunch of shapes
+  const candidate =
+    j?.room ??
+    j?.data ??
+    j?.rooms ??
+    (Array.isArray(j?.items) ? j.items.find((it: any) => (it?.year ?? year) === year) : undefined) ??
+    j;
+
+  return {
+    tfsa: num(candidate?.tfsa),
+    rrsp: num(candidate?.rrsp),
+    year,
+  };
+}
+function parseProgress(j: any, year: number): Progress {
+  const candidate = j?.progress ?? j?.data ?? j;
+  return {
+    tfsa_deposited: num(candidate?.tfsa_deposited),
+    rrsp_deposited: num(candidate?.rrsp_deposited),
+    resp_deposited: num(candidate?.resp_deposited),
+    year,
+  };
+}
+function parseChildren(j: any): Child[] {
+  if (Array.isArray(j)) return j;
+  if (Array.isArray(j?.items)) return j.items;
+  return [];
+}
+function parseAccounts(j: any): Account[] {
+  if (Array.isArray(j)) return j;
+  if (Array.isArray(j?.items)) return j.items;
+  if (Array.isArray(j?.accounts)) return j.accounts;
+  return [];
+}
+
+/* ===== Page ===== */
 export default function GoalsPage() {
   const { session } = useAuth();
   const token = session?.access_token ?? '';
 
-  // UI state you already had (defaults preserved)
+  // Pledge slider (persisted)
   const [pledge, setPledge] = useState<number>(() => loadLS('goals.pledge', 1000));
   useEffect(() => saveLS('goals.pledge', pledge), [pledge]);
 
-  // fetched state
+  // Data
   const [rooms, setRooms] = useState<Rooms | null>(null);
   const [progress, setProgress] = useState<Progress | null>(null);
   const [children, setChildren] = useState<Child[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
 
-  // mic + notes (kept same behavior)
+  // Mic + Notes
   const [isMicOn, setIsMicOn] = useState(false);
   const [text, setText] = useState('');
   const [notes, setNotes] = useState<Array<{ id: string; ts: string; text: string }>>(
@@ -65,7 +103,7 @@ export default function GoalsPage() {
   );
   useEffect(() => saveLS('goals.notes', notes), [notes]);
 
-  // fetch everything on token
+  // Fetch all data
   useEffect(() => {
     if (!token) return;
     const headers = { authorization: `Bearer ${token}` };
@@ -73,59 +111,41 @@ export default function GoalsPage() {
 
     (async () => {
       // rooms
-      const roomJ = (await fetchJson(`/api/rooms?year=${yr}`, headers)) ?? (await fetchJson(`/api/rooms`, headers));
-      const roomsParsed: Rooms = {
-        tfsa: num(roomJ?.tfsa ?? roomJ?.data?.tfsa),
-        rrsp: num(roomJ?.rrsp ?? roomJ?.data?.rrsp),
-        year: yr,
-      };
-      setRooms(roomsParsed);
+      const r1 = await getJson(`/api/rooms?year=${yr}`, headers);
+      const r2 = r1 ?? (await getJson(`/api/rooms`, headers));
+      setRooms(parseRooms(r2, yr));
 
       // progress
-      const progJ =
-        (await fetchJson(`/api/rooms/progress?year=${yr}`, headers)) ??
-        (await fetchJson(`/api/rooms/progress`, headers));
-      const progressParsed: Progress = {
-        tfsa_deposited: num(progJ?.tfsa_deposited),
-        rrsp_deposited: num(progJ?.rrsp_deposited),
-        resp_deposited: num(progJ?.resp_deposited),
-        year: yr,
-      };
-      setProgress(progressParsed);
+      const p1 = await getJson(`/api/rooms/progress?year=${yr}`, headers);
+      const p2 = p1 ?? (await getJson(`/api/rooms/progress`, headers));
+      setProgress(parseProgress(p2, yr));
 
       // children
-      const childrenJ = await fetchJson(`/api/children`, headers);
-      const kids = childrenJ?.ok && Array.isArray(childrenJ.items) ? (childrenJ.items as Child[]) : [];
-      setChildren(kids);
+      const c = await getJson(`/api/children`, headers);
+      setChildren(parseChildren(c));
 
       // accounts
-      const accountsJ = await fetchJson(`/api/accounts`, headers);
-      const accs = accountsJ?.ok && Array.isArray(accountsJ.items) ? (accountsJ.items as Account[]) : [];
-      setAccounts(accs);
-
-      // LOG everything so we can see it
-      console.log('[GOALS] FILE_TAG:', FILE_TAG);
-      console.log('[GOALS] rooms raw:', roomJ, 'parsed:', roomsParsed);
-      console.log('[GOALS] progress raw:', progJ, 'parsed:', progressParsed);
-      console.log('[GOALS] children raw:', childrenJ, 'parsed:', kids);
-      console.log('[GOALS] accounts raw:', accountsJ, 'parsed:', accs);
+      const a = await getJson(`/api/accounts`, headers);
+      setAccounts(parseAccounts(a));
     })();
   }, [token]);
 
   const monthsLeft = monthsLeftThisYear();
   const childCount = children?.length ?? 0;
-  const hasRespAccount = accounts.some(a => String(a.type).toUpperCase() === 'RESP');
+  const hasRespAccount = accounts.some((a) => String(a.type).toUpperCase() === 'RESP');
   const showRespTile = childCount > 0 || hasRespAccount;
 
-  // remaining
+  // Remaining room for this year
   const remaining = useMemo(() => {
     const tfsaRoom = num(rooms?.tfsa);
     const rrspRoom = num(rooms?.rrsp);
     const tfsaDep = num(progress?.tfsa_deposited);
     const rrspDep = num(progress?.rrsp_deposited);
     const respDep = num(progress?.resp_deposited);
-    const respTarget = childCount * 2500;
+
+    const respTarget = childCount * 2500; // $2,500/child match ceiling per calendar year
     const respRem = Math.max(0, respTarget - respDep);
+
     return {
       tfsa: Math.max(0, tfsaRoom - tfsaDep),
       rrsp: Math.max(0, rrspRoom - rrspDep),
@@ -133,7 +153,7 @@ export default function GoalsPage() {
     };
   }, [rooms, progress, childCount]);
 
-  // split (kept simple just for diagnosing)
+  // Monthly split (month-aware cap)
   const split = useMemo(() => {
     let left = pledge;
     const out = { resp: 0, tfsa: 0, rrsp: 0, margin: 0 };
@@ -159,41 +179,48 @@ export default function GoalsPage() {
     }
     if (left > 0) out.margin = left;
 
-    console.log('[GOALS] monthsLeft:', monthsLeft, 'remaining:', remaining, 'pledge:', pledge, 'split:', out);
     return out;
   }, [pledge, monthsLeft, remaining, childCount]);
 
-  // mic (unchanged; just the minimal working)
+  /* ===== Mic: live interim + final, simple & stable ===== */
   const recRef = useRef<any>(null);
   const interimRef = useRef('');
   const lastFinalRef = useRef('');
   const toggleMic = () => {
     if (isMicOn) {
-      try { recRef.current?.stop(); } catch {}
+      try {
+        recRef.current?.stop();
+      } catch {}
       recRef.current = null;
       setIsMicOn(false);
       return;
     }
     const SR = (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition;
-    if (!SR) { alert('Speech recognition not supported.'); return; }
+    if (!SR) {
+      alert('Speech recognition not supported.');
+      return;
+    }
     const rec = new SR();
     rec.lang = 'en-US';
     rec.continuous = true;
     rec.interimResults = true;
     rec.onresult = (ev: any) => {
-      let finalChunk = ''; let interimChunk = '';
+      let finalChunk = '';
+      let interimChunk = '';
       for (let i = ev.resultIndex; i < ev.results.length; i++) {
-        const res = ev.results[i]; const t = res[0]?.transcript ?? '';
-        if (res.isFinal) finalChunk += t; else interimChunk += t;
+        const res = ev.results[i];
+        const t = res[0]?.transcript ?? '';
+        if (res.isFinal) finalChunk += t;
+        else interimChunk += t;
       }
       if (finalChunk && finalChunk !== lastFinalRef.current) {
         lastFinalRef.current = finalChunk;
-        setText(p => (p + ' ' + finalChunk).trim());
+        setText((p) => (p + ' ' + finalChunk).trim());
         interimRef.current = '';
       }
       if (interimChunk && interimChunk !== interimRef.current) {
         interimRef.current = interimChunk;
-        setText(p => (p + ' ' + interimChunk).trim());
+        setText((p) => (p + ' ' + interimChunk).trim());
       }
     };
     rec.onend = () => setIsMicOn(false);
@@ -203,23 +230,22 @@ export default function GoalsPage() {
     setIsMicOn(true);
   };
 
+  // Notes
   const saveNote = () => {
     const t = text.trim();
     if (!t) return;
     const id = 'id-' + Math.random().toString(36).slice(2);
     const ts = new Date().toISOString();
-    setNotes(arr => [{ id, ts, text: t }, ...arr]);
+    setNotes((arr) => [{ id, ts, text: t }, ...arr]);
     setText('');
     lastFinalRef.current = '';
     interimRef.current = '';
   };
-  const deleteNote = (id: string) => setNotes(arr => arr.filter(n => n.id !== id));
+  const deleteNote = (id: string) => setNotes((arr) => arr.filter((n) => n.id !== id));
 
+  /* ===== UI ===== */
   return (
     <main className="max-w-6xl mx-auto p-4 space-y-4">
-      {/* header */}
-      <div className="text-xs text-gray-500">Goals • {FILE_TAG}</div>
-
       {/* Monthly pledge */}
       <section className="rounded-2xl border bg-white p-4 shadow-sm">
         <div className="text-sm font-medium mb-3">Monthly pledge</div>
@@ -237,21 +263,19 @@ export default function GoalsPage() {
         </div>
         <div className="mt-2 text-xs text-gray-500">
           Recommendation is specific to{' '}
-          {new Date().toLocaleString(undefined, { month: 'long', year: 'numeric' })}{' '}
-          ({monthsLeft} {monthsLeft === 1 ? 'month' : 'months'} left this year).
+          {new Date().toLocaleString(undefined, { month: 'long', year: 'numeric' })} ({monthsLeft}{' '}
+          {monthsLeft === 1 ? 'month' : 'months'} left this year).
         </div>
       </section>
 
       {/* Recommendation tiles */}
       <section className="rounded-2xl border bg-white p-4 shadow-sm">
         <div className="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-4 gap-3">
-          {(childCount > 0 || hasRespAccount) && (
+          {showRespTile && (
             <div className="rounded-xl border p-4">
               <div className="text-xs text-gray-600 mb-1">RESP</div>
               <div className="text-2xl font-semibold">{CAD(split.resp)}</div>
-              <div className="text-[11px] text-gray-500 mt-1">
-                Remaining this year: {CAD(remaining.resp)}
-              </div>
+              <div className="text-[11px] text-gray-500 mt-1">Remaining this year: {CAD(remaining.resp)}</div>
             </div>
           )}
           <div className="rounded-xl border p-4">
@@ -295,9 +319,7 @@ export default function GoalsPage() {
           className="w-full min-h-[140px] rounded-lg border p-3 outline-none"
           placeholder="Speak or type your plan..."
         />
-        <div className="mt-2 text-xs text-gray-500">
-          Your microphone text appears live while you speak. Click “Save note” to keep a record below.
-        </div>
+        <div className="mt-2 text-xs text-gray-500">Notes are stored in your browser for now.</div>
       </section>
 
       {/* Past notes */}
@@ -333,35 +355,20 @@ export default function GoalsPage() {
         )}
       </section>
 
-      {/* === DEBUG OVERLAY === */}
-      <section className="rounded-2xl border bg-amber-50 p-4 text-xs">
-        <div className="font-semibold mb-2">Debug ({FILE_TAG})</div>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+      {/* Collapsible debug (click to open) */}
+      <details className="rounded-2xl border bg-amber-50 p-4 text-xs">
+        <summary className="cursor-pointer font-medium">Debug (rooms / progress / children / accounts)</summary>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
           <pre className="overflow-auto p-2 bg-white border rounded">rooms: {JSON.stringify(rooms, null, 2)}</pre>
           <pre className="overflow-auto p-2 bg-white border rounded">progress: {JSON.stringify(progress, null, 2)}</pre>
           <pre className="overflow-auto p-2 bg-white border rounded">children: {JSON.stringify(children, null, 2)}</pre>
           <pre className="overflow-auto p-2 bg-white border rounded">accounts: {JSON.stringify(accounts, null, 2)}</pre>
           <pre className="overflow-auto p-2 bg-white border rounded">
-            remaining: {JSON.stringify(
-              (function() {
-                const tfsaRoom = num(rooms?.tfsa);
-                const rrspRoom = num(rooms?.rrsp);
-                const tfsaDep = num(progress?.tfsa_deposited);
-                const rrspDep = num(progress?.rrsp_deposited);
-                const respDep = num(progress?.resp_deposited);
-                const respTarget = (children?.length ?? 0) * 2500;
-                return {
-                  monthsLeft: monthsLeftThisYear(),
-                  tfsaRoom, rrspRoom, tfsaDep, rrspDep, respDep, respTarget
-                };
-              })(),
-              null,
-              2
-            )}
+            remaining: {JSON.stringify(remaining, null, 2)}; monthsLeft: {monthsLeft}
           </pre>
           <pre className="overflow-auto p-2 bg-white border rounded">pledge: {pledge}</pre>
         </div>
-      </section>
+      </details>
     </main>
   );
 }
