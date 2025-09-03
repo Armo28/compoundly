@@ -1,13 +1,5 @@
 'use client';
 
-/* Goals page — original UI + mic icon + robust months-left split
-   - Tries /api/rooms?year=YYYY and /api/rooms (fallback)
-   - Tries /api/rooms/progress?year=YYYY and /api/rooms/progress (fallback)
-   - Also fetches /api/children and /api/accounts to decide RESP tile visibility
-   - Priority: RESP (only if user has a child) → TFSA → RRSP → remainder to Margin
-   - Slider value persists between sessions (defaults: CA$1,000; first run)
-*/
-
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useAuth } from '@/lib/auth';
 
@@ -21,8 +13,6 @@ const CAD = (n: number) =>
 
 const now = () => new Date();
 const currentYear = () => now().getFullYear();
-
-/** Months left INCLUSIVE of this month (Sep → 4: Sep, Oct, Nov, Dec). */
 function monthsLeftThisYear(d = now()) {
   return Math.max(1, 12 - d.getMonth());
 }
@@ -34,10 +24,9 @@ type Progress = {
   resp_deposited?: number;
   year: number;
 };
-type Child = { id: string; name: string; birth_year: number };
+type Child = { id: string; name: string };
 type Account = { id: string; type: string; name?: string; balance?: number };
 
-// localStorage (safe)
 function loadLS<T>(k: string, fallback: T): T {
   if (typeof window === 'undefined') return fallback;
   try {
@@ -72,15 +61,13 @@ export default function GoalsPage() {
   const { session } = useAuth();
   const token = session?.access_token ?? '';
 
-  // pledge slider (persist; default CA$1,000 for first-time users)
   const [pledge, setPledge] = useState<number>(() => loadLS('goals.pledge', 1000));
   useEffect(() => saveLS('goals.pledge', pledge), [pledge]);
 
-  // fetched state
   const [rooms, setRooms] = useState<Rooms | null>(null);
   const [progress, setProgress] = useState<Progress | null>(null);
   const [children, setChildren] = useState<Child[]>([]);
-  const [hasRespAccount, setHasRespAccount] = useState(false);
+  const [accounts, setAccounts] = useState<Account[]>([]);
 
   // mic + notes
   const [isMicOn, setIsMicOn] = useState(false);
@@ -90,50 +77,42 @@ export default function GoalsPage() {
   );
   useEffect(() => saveLS('goals.notes', notes), [notes]);
 
-  // fetch current-year room / progress / children / accounts
+  // fetch rooms/progress/children/accounts
   useEffect(() => {
     if (!token) return;
     const headers = { authorization: `Bearer ${token}` };
     const yr = currentYear();
 
     (async () => {
-      // ----- contribution rooms -----
+      // rooms
       let roomJ =
         (await fetchJson(`/api/rooms?year=${yr}`, headers)) ??
         (await fetchJson(`/api/rooms`, headers));
-      if (roomJ && roomJ.ok !== false) {
-        // tolerate different shapes
-        const tfsa = num(roomJ.tfsa ?? roomJ?.data?.tfsa);
-        const rrsp = num(roomJ.rrsp ?? roomJ?.data?.rrsp);
-        setRooms({ tfsa, rrsp, year: yr });
-      } else {
-        setRooms({ tfsa: 0, rrsp: 0, year: yr });
-      }
+      setRooms({
+        tfsa: num(roomJ?.tfsa ?? roomJ?.data?.tfsa),
+        rrsp: num(roomJ?.rrsp ?? roomJ?.data?.rrsp),
+        year: yr,
+      });
 
-      // ----- deposited so far -----
+      // progress
       let progJ =
         (await fetchJson(`/api/rooms/progress?year=${yr}`, headers)) ??
         (await fetchJson(`/api/rooms/progress`, headers));
-      if (progJ && progJ.ok !== false) {
-        setProgress({
-          tfsa_deposited: num(progJ.tfsa_deposited),
-          rrsp_deposited: num(progJ.rrsp_deposited),
-          resp_deposited: num(progJ.resp_deposited),
-          year: yr,
-        });
-      } else {
-        setProgress({ tfsa_deposited: 0, rrsp_deposited: 0, resp_deposited: 0, year: yr });
-      }
+      setProgress({
+        tfsa_deposited: num(progJ?.tfsa_deposited),
+        rrsp_deposited: num(progJ?.rrsp_deposited),
+        resp_deposited: num(progJ?.resp_deposited),
+        year: yr,
+      });
 
-      // ----- children -----
+      // children
       const childrenJ = await fetchJson(`/api/children`, headers);
       if (childrenJ?.ok && Array.isArray(childrenJ.items)) setChildren(childrenJ.items);
 
-      // ----- accounts (for RESP tile visibility even if no child yet) -----
+      // accounts
       const accountsJ = await fetchJson(`/api/accounts`, headers);
       if (accountsJ?.ok && Array.isArray(accountsJ.items)) {
-        const items = accountsJ.items as Account[];
-        setHasRespAccount(items.some((a) => String(a.type).toUpperCase() === 'RESP'));
+        setAccounts(accountsJ.items as Account[]);
       }
     })();
   }, [token]);
@@ -141,7 +120,7 @@ export default function GoalsPage() {
   const monthsLeft = monthsLeftThisYear();
   const childCount = children?.length ?? 0;
 
-  // compute remaining rooms (room - deposited)
+  // remaining rooms
   const remaining = useMemo(() => {
     const tfsaRoom = num(rooms?.tfsa);
     const rrspRoom = num(rooms?.rrsp);
@@ -149,26 +128,23 @@ export default function GoalsPage() {
     const rrspDep = num(progress?.rrsp_deposited);
     const respDep = num(progress?.resp_deposited);
 
-    // RESP target = $2,500 per child per year (grant max)
     const respTarget = childCount * 2500;
     const respRem = Math.max(0, respTarget - respDep);
 
     return {
       tfsa: Math.max(0, tfsaRoom - tfsaDep),
       rrsp: Math.max(0, rrspRoom - rrspDep),
-      resp: respRem, // 0 if no child
+      resp: respRem,
     };
   }, [rooms, progress, childCount]);
 
-  // priority allocation for this month
+  // monthly split
   const split = useMemo(() => {
     let left = pledge;
     const out = { resp: 0, tfsa: 0, rrsp: 0, margin: 0 };
-
-    // helper: max to contribute this month to fully use room by year-end
     const capPerMonth = (room: number) => Math.ceil(room / monthsLeft);
 
-    // 1) RESP only if user has a child (priority rule)
+    // RESP priority only if user has child
     if (childCount > 0 && remaining.resp > 0 && left > 0) {
       const cap = capPerMonth(remaining.resp);
       const amt = Math.min(left, cap);
@@ -176,7 +152,6 @@ export default function GoalsPage() {
       left -= amt;
     }
 
-    // 2) TFSA
     if (remaining.tfsa > 0 && left > 0) {
       const cap = capPerMonth(remaining.tfsa);
       const amt = Math.min(left, cap);
@@ -184,7 +159,6 @@ export default function GoalsPage() {
       left -= amt;
     }
 
-    // 3) RRSP
     if (remaining.rrsp > 0 && left > 0) {
       const cap = capPerMonth(remaining.rrsp);
       const amt = Math.min(left, cap);
@@ -192,31 +166,34 @@ export default function GoalsPage() {
       left -= amt;
     }
 
-    // 4) remainder
     if (left > 0) out.margin = left;
 
     return out;
   }, [pledge, monthsLeft, remaining, childCount]);
 
-  // ---------- mic (icon) ----------
-  const recRef = useRef<SpeechRecognition | null>(null);
+  // mic toggle
+  const recRef = useRef<any>(null);
   const interimRef = useRef('');
   const lastFinalRef = useRef('');
-
-  const startMic = () => {
-    if (typeof window === 'undefined') return;
-    const SR =
-      (window as any).webkitSpeechRecognition ||
-      (window as any).SpeechRecognition;
-    if (!SR) {
-      alert('Speech recognition is not supported in this browser.');
+  const toggleMic = () => {
+    if (isMicOn) {
+      try {
+        recRef.current?.stop();
+      } catch {}
+      recRef.current = null;
+      setIsMicOn(false);
       return;
     }
-    const rec: SpeechRecognition = new SR();
+    const SR =
+      (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition;
+    if (!SR) {
+      alert('Speech recognition not supported.');
+      return;
+    }
+    const rec = new SR();
     rec.lang = 'en-US';
     rec.continuous = true;
     rec.interimResults = true;
-
     rec.onresult = (ev: any) => {
       let finalChunk = '';
       let interimChunk = '';
@@ -228,32 +205,20 @@ export default function GoalsPage() {
       }
       if (finalChunk && finalChunk !== lastFinalRef.current) {
         lastFinalRef.current = finalChunk;
-        setText((prev) => (prev + ' ' + finalChunk).trim());
+        setText((p) => (p + ' ' + finalChunk).trim());
         interimRef.current = '';
       }
       if (interimChunk && interimChunk !== interimRef.current) {
         interimRef.current = interimChunk;
-        setText((prev) => (prev + ' ' + interimChunk).trim());
+        setText((p) => (p + ' ' + interimChunk).trim());
       }
     };
-    rec.onerror = () => stopMic();
     rec.onend = () => setIsMicOn(false);
-
+    rec.onerror = () => setIsMicOn(false);
     recRef.current = rec;
     rec.start();
     setIsMicOn(true);
   };
-
-  const stopMic = () => {
-    try {
-      recRef.current?.stop();
-    } catch {}
-    recRef.current = null;
-    setIsMicOn(false);
-    interimRef.current = '';
-  };
-
-  const toggleMic = () => (isMicOn ? stopMic() : startMic());
 
   // notes
   const saveNote = () => {
@@ -268,7 +233,8 @@ export default function GoalsPage() {
   };
   const deleteNote = (id: string) => setNotes((arr) => arr.filter((n) => n.id !== id));
 
-  // RESP tile visible: child OR RESP account present
+  // RESP tile visible if RESP account exists OR child exists
+  const hasRespAccount = accounts.some((a) => String(a.type).toUpperCase() === 'RESP');
   const showRespTile = childCount > 0 || hasRespAccount;
 
   return (
@@ -279,8 +245,8 @@ export default function GoalsPage() {
         <div className="flex items-center gap-4">
           <div className="min-w-[120px] text-sm text-gray-700">{CAD(pledge)}</div>
           <input
-            className="flex-1 h-2 rounded-lg bg-gray-200 appearance-none accent-indigo-600"
             type="range"
+            className="flex-1 h-2 rounded-lg bg-gray-200 appearance-none accent-indigo-600"
             min={0}
             max={10000}
             step={25}
@@ -295,13 +261,8 @@ export default function GoalsPage() {
         </div>
       </section>
 
-      {/* Recommendation tiles (original style) */}
+      {/* Recommendation tiles */}
       <section className="rounded-2xl border bg-white p-4 shadow-sm">
-        <div className="text-sm font-medium mb-3">
-          Suggested monthly split for{' '}
-          {new Date().toLocaleString(undefined, { month: 'long', year: 'numeric' })}
-        </div>
-
         <div className="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-4 gap-3">
           {showRespTile && (
             <div className="rounded-xl border p-4">
@@ -309,15 +270,9 @@ export default function GoalsPage() {
               <div className="text-2xl font-semibold">{CAD(split.resp)}</div>
               <div className="text-[11px] text-gray-500 mt-1">
                 Remaining this year: {CAD(remaining.resp)}
-                {childCount === 0 && hasRespAccount && (
-                  <span className="ml-1 text-[11px] text-amber-600">
-                    (add a child to prioritize RESP)
-                  </span>
-                )}
               </div>
             </div>
           )}
-
           <div className="rounded-xl border p-4">
             <div className="text-xs text-gray-600 mb-1">TFSA</div>
             <div className="text-2xl font-semibold">{CAD(split.tfsa)}</div>
@@ -325,7 +280,6 @@ export default function GoalsPage() {
               Remaining this year: {CAD(remaining.tfsa)}
             </div>
           </div>
-
           <div className="rounded-xl border p-4">
             <div className="text-xs text-gray-600 mb-1">RRSP</div>
             <div className="text-2xl font-semibold">{CAD(split.rrsp)}</div>
@@ -333,33 +287,22 @@ export default function GoalsPage() {
               Remaining this year: {CAD(remaining.rrsp)}
             </div>
           </div>
-
           <div className="rounded-xl border p-4">
             <div className="text-xs text-gray-600 mb-1">Margin/Other</div>
             <div className="text-2xl font-semibold">{CAD(split.margin)}</div>
           </div>
         </div>
-
-        <div className="text-xs text-gray-500 mt-3">
-          Order of priority: RESP (only when you have a child) → TFSA to available room → RRSP to
-          available room → remainder to an unregistered account. Calculations prorate by{' '}
-          <span className="font-medium">{monthsLeft}</span> months left this year.
-        </div>
       </section>
 
-      {/* Mic + notes (original section, with MIC ICON toggle) */}
+      {/* Mic + Notes */}
       <section className="rounded-2xl border bg-white p-4 shadow-sm">
         <div className="text-sm font-medium mb-3">Describe your goals</div>
-
         <div className="flex items-center gap-2 mb-3">
           <button
             onClick={toggleMic}
-            aria-label={isMicOn ? 'Stop microphone' : 'Start microphone'}
-            title={isMicOn ? 'Stop microphone' : 'Start microphone'}
             className={`rounded p-2 ${isMicOn ? 'bg-red-600' : 'bg-emerald-600'} text-white`}
           >
-            {/* mic icon */}
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
               <path
                 d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Z"
                 stroke="currentColor"
@@ -376,29 +319,25 @@ export default function GoalsPage() {
               />
             </svg>
           </button>
-
           <button onClick={saveNote} className="rounded bg-indigo-600 px-3 py-2 text-white">
             Save note
           </button>
         </div>
-
         <textarea
           value={text}
           onChange={(e) => setText(e.target.value)}
-          className="w-full min-h-[160px] rounded-lg border p-3 outline-none"
+          className="w-full min-h-[140px] rounded-lg border p-3 outline-none"
           placeholder="Speak or type your plan..."
         />
-
         <div className="mt-2 text-xs text-gray-500">
           Your microphone text appears live while you speak. Click “Save note” to keep a record
           below. (Notes are stored in your browser for now.)
         </div>
       </section>
 
-      {/* Past Goals list (collapsible) */}
+      {/* Past notes */}
       <section className="rounded-2xl border bg-white p-4 shadow-sm">
         <div className="text-sm font-medium mb-3">Past Goals</div>
-
         {notes.length === 0 ? (
           <div className="text-sm text-gray-600">No saved goals yet.</div>
         ) : (
@@ -435,20 +374,6 @@ export default function GoalsPage() {
   );
 }
 
-// ---------- tiny utils ----------
 function cryptoId() {
-  if (typeof crypto !== 'undefined' && (crypto as any).randomUUID) {
-    return (crypto as any).randomUUID();
-  }
   return 'id-' + Math.random().toString(36).slice(2);
 }
-
-/* ---------- SpeechRecognition typings (safe shim) ---------- */
-declare global {
-  interface Window {
-    webkitSpeechRecognition?: any;
-    SpeechRecognition?: any;
-  }
-}
-// Avoid conflicts with lib.dom — treat as 'any'
-type SpeechRecognition = any;
