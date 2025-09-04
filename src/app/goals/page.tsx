@@ -63,19 +63,19 @@ const num = (x: any) => {
   return Number.isFinite(n) ? n : 0;
 };
 
-const CESG_LIFETIME_CAP = 7200;     // per child lifetime grant
+// RESP rules (simple, fungible, family RESP logic)
+const CESG_LIFETIME_CAP = 7200;          // per child lifetime grant
 const RESP_LIFETIME_CONTRIB_CAP = 50000; // per child lifetime contributions
-const BASE_PER_YEAR_CONTRIB = 2500; // earns base $500 grant (20%)
-const CATCHUP_PER_YEAR_CONTRIB = 2500; // extra $500 grant if carry-forward exists
-const MAX_GRANTABLE_PER_YEAR = BASE_PER_YEAR_CONTRIB + CATCHUP_PER_YEAR_CONTRIB; // 5000
+const BASE_PER_YEAR_CONTRIB = 2500;      // earns $500 grant (20%)
+const CATCHUP_PER_YEAR_CONTRIB = 2500;   // extra $500 grant if carry-forward eligible
+const MAX_GRANTABLE_PER_YEAR = BASE_PER_YEAR_CONTRIB + CATCHUP_PER_YEAR_CONTRIB;
 
-// Decide if catch-up can be considered (simple heuristic per your instruction)
 function allowCatchupForChild(child: Child) {
   const age = currentYear() - Number(child.birth_year || currentYear());
-  // simple: if child is > 1 year old and still has lifetime CESG headroom, allow catch-up
   const cesgReceived = num(child.cesg_received_to_date);
   const lifetimeGrantLeft = Math.max(0, CESG_LIFETIME_CAP - cesgReceived);
-  return age > 1 && lifetimeGrantLeft >= 500; // at least one extra $500 grant possible
+  // simple heuristic: if child >1 and has grant headroom, allow catch-up
+  return age > 1 && lifetimeGrantLeft >= 500;
 }
 
 // ---------- page ----------
@@ -95,40 +95,43 @@ export default function GoalsPage() {
   // mic + notes
   const [isMicOn, setIsMicOn] = useState(false);
   const [text, setText] = useState('');
+  const [interim, setInterim] = useState(''); // show live speech separately (prevents duplicates)
   const [notes, setNotes] = useState<Array<{ id: string; ts: string; text: string }>>(
     () => loadLS('goals.notes', [])
   );
   useEffect(() => saveLS('goals.notes', notes), [notes]);
 
-  // fetch rooms/progress/children/accounts
+  // fetch rooms/progress/children/accounts  (FIXED JSON PATHS)
   useEffect(() => {
     if (!token) return;
     const headers = { authorization: `Bearer ${token}` };
     const yr = currentYear();
 
     (async () => {
-      // rooms
+      // rooms: expect { ok, room: { year, tfsa, rrsp } }
       let roomJ =
         (await fetchJson(`/api/rooms?year=${yr}`, headers)) ??
         (await fetchJson(`/api/rooms`, headers));
+      const room = roomJ?.room ?? roomJ?.data ?? roomJ ?? null;
       setRooms({
-        tfsa: num(roomJ?.tfsa ?? roomJ?.data?.tfsa),
-        rrsp: num(roomJ?.rrsp ?? roomJ?.data?.rrsp),
+        tfsa: num(room?.tfsa),
+        rrsp: num(room?.rrsp),
         year: yr,
       });
 
-      // progress (tfsa/rrsp/resp deposited so far this year)
+      // progress: expect { ok, progress: { tfsa_deposited, rrsp_deposited, resp_deposited } }
       let progJ =
         (await fetchJson(`/api/rooms/progress?year=${yr}`, headers)) ??
         (await fetchJson(`/api/rooms/progress`, headers));
+      const prog = progJ?.progress ?? progJ?.data ?? progJ ?? null;
       setProgress({
-        tfsa_deposited: num(progJ?.tfsa_deposited),
-        rrsp_deposited: num(progJ?.rrsp_deposited),
-        resp_deposited: num(progJ?.resp_deposited),
+        tfsa_deposited: num(prog?.tfsa_deposited),
+        rrsp_deposited: num(prog?.rrsp_deposited),
+        resp_deposited: num(prog?.resp_deposited),
         year: yr,
       });
 
-      // children (now may include lifetime fields; default 0 if absent)
+      // children: expect { ok, items: [...] }
       const childrenJ = await fetchJson(`/api/children`, headers);
       if (childrenJ?.ok && Array.isArray(childrenJ.items)) {
         const list = (childrenJ.items as any[]).map((c) => ({
@@ -139,21 +142,27 @@ export default function GoalsPage() {
           cesg_received_to_date: num(c.cesg_received_to_date),
         })) as Child[];
         setChildren(list);
+      } else {
+        setChildren([]);
       }
 
-      // accounts
+      // accounts: expect { ok, items: [...] }
       const accountsJ = await fetchJson(`/api/accounts`, headers);
       if (accountsJ?.ok && Array.isArray(accountsJ.items)) {
         setAccounts(accountsJ.items as Account[]);
+      } else {
+        setAccounts([]);
       }
     })();
   }, [token]);
 
   const monthsLeft = monthsLeftThisYear();
   const childCount = children?.length ?? 0;
-  const hasRespAccount = (accounts ?? []).some(
-    (a) => String(a.type).toUpperCase() === 'RESP'
-  );
+
+  // robust RESP account detection (handles 'Resp', 'RESP ', etc.)
+  const hasRespAccount = useMemo(() => {
+    return (accounts ?? []).some((a) => String(a.type || '').toUpperCase().includes('RESP'));
+  }, [accounts]);
 
   // remaining TFSA/RRSP for THIS year (based on Room + Progress)
   const remaining = useMemo(() => {
@@ -168,13 +177,11 @@ export default function GoalsPage() {
     };
   }, [rooms, progress]);
 
-  // RESP: compute TOTAL grantable contribution remaining THIS year across all children,
-  // respecting per-child annual caps and lifetime caps, with simple catch-up.
+  // RESP grantable THIS year across all children (family RESP, fungible)
   const respGrantableThisYear = useMemo(() => {
     if (childCount === 0) return 0;
 
     const totalRespDeposited = num(progress?.resp_deposited);
-    // If we don't know per-child progress, apportion equally (simple v1 approach)
     const perChildDepositedThisYear = totalRespDeposited / childCount;
 
     let sumRemaining = 0;
@@ -193,16 +200,10 @@ export default function GoalsPage() {
 
       const catchup = allowCatchupForChild(child);
       const perYearCapByRule = catchup ? MAX_GRANTABLE_PER_YEAR : BASE_PER_YEAR_CONTRIB;
-
-      // Also cap by lifetime grant left converted to contribution units (20% match)
       const perYearCapByGrantHeadroom = Math.min(perYearCapByRule, lifetimeGrantLeft / 0.2);
-
-      // And cap by lifetime contribution remaining for the child
       const perYearCap = Math.max(0, Math.min(perYearCapByGrantHeadroom, lifetimeContribLeft));
 
-      // This year's remaining for this child:
       const remainingForChild = Math.max(0, perYearCap - perChildDepositedThisYear);
-
       sumRemaining += remainingForChild;
     }
 
@@ -214,7 +215,7 @@ export default function GoalsPage() {
     let left = pledge;
     const out = { resp: 0, tfsa: 0, rrsp: 0, margin: 0 };
 
-    // RESP first (only if there's an RESP account; if not, we just show a nudge)
+    // RESP first (only if there's an RESP account; if not, we just show a nudge & keep $0)
     if (hasRespAccount && respGrantableThisYear > 0 && left > 0) {
       const respCapPerMonth = Math.ceil(respGrantableThisYear / monthsLeft);
       const amt = Math.min(left, respCapPerMonth);
@@ -248,9 +249,8 @@ export default function GoalsPage() {
   const mentionKidsInText = /\b(child|children|kid|kids)\b/i.test(text);
   const showRespNudge = mentionKidsInText && !hasRespAccount && childCount > 0;
 
-  // mic toggle (with interim + final handling)
+  // --- Microphone (fixed: no duplicate interim text) ---
   const recRef = useRef<any>(null);
-  const interimRef = useRef('');
   const lastFinalRef = useRef('');
   const toggleMic = () => {
     if (isMicOn) {
@@ -259,6 +259,7 @@ export default function GoalsPage() {
       } catch {}
       recRef.current = null;
       setIsMicOn(false);
+      setInterim('');
       return;
     }
     const SR =
@@ -280,18 +281,24 @@ export default function GoalsPage() {
         if (res.isFinal) finalChunk += t;
         else interimChunk += t;
       }
+      // append ONLY finals to the saved text (once)
       if (finalChunk && finalChunk !== lastFinalRef.current) {
         lastFinalRef.current = finalChunk;
-        setText((p) => (p + ' ' + finalChunk).trim());
-        interimRef.current = '';
-      }
-      if (interimChunk && interimChunk !== interimRef.current) {
-        interimRef.current = interimChunk;
-        setText((p) => (p + ' ' + interimChunk).trim());
+        setText((p) => (p ? (p + ' ' + finalChunk).trim() : finalChunk.trim()));
+        setInterim('');
+      } else {
+        // show interim separately (not added to saved text)
+        setInterim(interimChunk);
       }
     };
-    rec.onend = () => setIsMicOn(false);
-    rec.onerror = () => setIsMicOn(false);
+    rec.onend = () => {
+      setIsMicOn(false);
+      setInterim('');
+    };
+    rec.onerror = () => {
+      setIsMicOn(false);
+      setInterim('');
+    };
     recRef.current = rec;
     rec.start();
     setIsMicOn(true);
@@ -299,19 +306,22 @@ export default function GoalsPage() {
 
   // notes
   const saveNote = () => {
-    const t = text.trim();
+    const t = (text + (interim ? ' ' + interim : '')).trim();
     if (!t) return;
     const id = cryptoId();
     const ts = new Date().toISOString();
     setNotes((arr) => [{ id, ts, text: t }, ...arr]);
     setText('');
+    setInterim('');
     lastFinalRef.current = '';
-    interimRef.current = '';
   };
   const deleteNote = (id: string) => setNotes((arr) => arr.filter((n) => n.id !== id));
 
   // RESP tile visible if RESP account exists OR child exists
   const showRespTile = childCount > 0 || hasRespAccount;
+
+  // computed text shown in the textarea (final + interim live)
+  const displayText = (text + (interim ? ' ' + interim : '')).trim();
 
   return (
     <main className="max-w-6xl mx-auto p-4 space-y-4">
@@ -370,7 +380,7 @@ export default function GoalsPage() {
           <div className="rounded-xl border p-4">
             <div className="text-xs text-gray-600 mb-1">RRSP</div>
             <div className="text-2xl font-semibold">{CAD(split.rrsp)}</div>
-            <div className="text-[11px] text-gray-500 mt-1">
+            <div className="text-[11px] text-gray-500 mt-1}>
               Remaining this year: {CAD(remaining.rrsp)}
             </div>
           </div>
@@ -412,8 +422,11 @@ export default function GoalsPage() {
           </button>
         </div>
         <textarea
-          value={text}
-          onChange={(e) => setText(e.target.value)}
+          value={displayText}
+          onChange={(e) => {
+            setText(e.target.value);
+            setInterim('');
+          }}
           className="w-full min-h-[140px] rounded-lg border p-3 outline-none"
           placeholder="Speak or type your plan..."
         />
