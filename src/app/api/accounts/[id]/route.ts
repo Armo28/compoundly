@@ -1,43 +1,31 @@
+cat > src/app/api/accounts/\[id]/route.ts <<'TS'
 import { NextRequest } from 'next/server';
-import { getRouteClient, jsonErr, jsonOK, requireUser } from '@/lib/supabaseRoute';
+import { getRouteClient, requireUser, jsonOK, jsonErr } from '@/lib/supabaseRoute';
 
 export async function PATCH(req: NextRequest, { params }: { params: { id: string } }) {
   try {
     const user = await requireUser(req);
     const { supabase } = getRouteClient(req);
-    const { institution, type, balance } = await req.json();
+    const body = await req.json();
 
-    const { data: updated, error } = await supabase
+    const updates: Record<string, any> = {};
+    if (body.balance !== undefined) updates.balance = Number(body.balance);
+    if (body.name !== undefined) updates.name = String(body.name).trim();
+    if (body.type !== undefined) updates.type = String(body.type).toUpperCase();
+    if (body.is_family_resp !== undefined) updates.is_family_resp = Boolean(body.is_family_resp);
+    if (body.children_covered !== undefined)
+      updates.children_covered = Math.max(1, Number(body.children_covered));
+
+    const { data, error } = await supabase
       .from('manual_accounts')
-      .update({
-        institution,
-        type,
-        balance: Number(balance || 0),
-      })
+      .update(updates)
       .eq('id', params.id)
       .eq('user_id', user.id)
-      .select()
+      .select('id, name, type, balance, is_family_resp, children_covered, created_at')
       .single();
 
     if (error) throw error;
-
-    // Recompute total and UPSERT today's snapshot
-    const { data: sumRows, error: sumErr } = await supabase
-      .from('manual_accounts')
-      .select('balance')
-      .eq('user_id', user.id);
-    if (sumErr) throw sumErr;
-
-    const total = (sumRows ?? []).reduce((a, r: any) => a + Number(r.balance || 0), 0);
-    const today = new Date().toISOString().slice(0, 10);
-
-    const { error: upErr } = await supabase
-      .from('account_snapshots')
-      .upsert({ user_id: user.id, taken_on: today, total }, { onConflict: 'user_id,taken_on' });
-
-    if (upErr) throw upErr;
-
-    return jsonOK({ ok: true, account: updated });
+    return jsonOK({ ok: true, item: data });
   } catch (e: any) {
     return jsonErr(e?.message ?? 'Server error', e?.status ?? 500);
   }
@@ -53,26 +41,11 @@ export async function DELETE(req: NextRequest, { params }: { params: { id: strin
       .delete()
       .eq('id', params.id)
       .eq('user_id', user.id);
+
     if (error) throw error;
-
-    // Recompute total and UPSERT today's snapshot
-    const { data: sumRows, error: sumErr } = await supabase
-      .from('manual_accounts')
-      .select('balance')
-      .eq('user_id', user.id);
-    if (sumErr) throw sumErr;
-
-    const total = (sumRows ?? []).reduce((a, r: any) => a + Number(r.balance || 0), 0);
-    const today = new Date().toISOString().slice(0, 10);
-
-    const { error: upErr } = await supabase
-      .from('account_snapshots')
-      .upsert({ user_id: user.id, taken_on: today, total }, { onConflict: 'user_id,taken_on' });
-
-    if (upErr) throw upErr;
-
     return jsonOK({ ok: true });
   } catch (e: any) {
     return jsonErr(e?.message ?? 'Server error', e?.status ?? 500);
   }
 }
+TS
