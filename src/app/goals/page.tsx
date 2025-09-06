@@ -39,7 +39,11 @@ function useLS<T>(key: string, initial: T) {
 export default function GoalsPage() {
   const { session } = useAuth();
   const token = session?.access_token ?? '';
-  const headers = useMemo(() => (token ? { authorization: `Bearer ${token}` } : {}), [token]);
+
+  const authHeaders = useMemo<HeadersInit | undefined>(
+    () => (token ? { authorization: `Bearer ${token}` } : undefined),
+    [token]
+  );
 
   const [pledge, setPledge] = useLS<number>('goals.pledge', 1000);
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -56,19 +60,18 @@ export default function GoalsPage() {
   const interimRef = useRef('');
 
   useEffect(() => {
-    if (!token) return;
+    if (!authHeaders) return;
     (async () => {
-      const r1 = await fetch('/api/accounts', { headers });
+      const r1 = await fetch('/api/accounts', { headers: authHeaders });
       const j1 = await r1.json();
       if (j1?.ok) setAccounts(j1.items ?? []);
 
-      const r2 = await fetch('/api/resp-progress', { headers });
+      const r2 = await fetch('/api/resp-progress', { headers: authHeaders });
       const j2 = await r2.json();
       if (j2?.ok) setRespProg(j2);
     })();
-  }, [token]);
+  }, [authHeaders]);
 
-  // RESP visibility + children covered
   const childrenCovered = useMemo(
     () =>
       (accounts || [])
@@ -81,7 +84,6 @@ export default function GoalsPage() {
   );
   const hasResp = childrenCovered > 0;
 
-  // RESP remaining
   const monthsLeft = monthsLeftThisYear();
   const RESP_ANNUAL = 2500;
   const RESP_LIFETIME = 50000;
@@ -95,7 +97,7 @@ export default function GoalsPage() {
     childrenCovered * RESP_LIFETIME - Number(respProg?.deposited_total || 0)
   );
 
-  // TODO: plug real TFSA/RRSP rooms; placeholders for now
+  // TODO: wire real TFSA/RRSP “remaining room” once those APIs are in place
   const tfsaRemaining = 0;
   const rrspRemaining = 0;
 
@@ -118,6 +120,7 @@ export default function GoalsPage() {
       out.tfsa = amt;
       left -= amt;
     }
+
     if (rrspRemaining > 0 && left > 0) {
       const cap = Math.ceil(rrspRemaining / monthsLeft);
       const amt = Math.min(left, cap);

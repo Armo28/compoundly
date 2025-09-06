@@ -17,8 +17,16 @@ const TYPES = ['TFSA', 'RRSP', 'RESP', 'LIRA', 'Margin', 'Other'] as const;
 export default function AccountsPage() {
   const { session } = useAuth();
   const token = session?.access_token ?? '';
-  const headers = useMemo(
-    () => (token ? { authorization: `Bearer ${token}`, 'content-type': 'application/json' } : {}),
+
+  // EXPLICIT: only defined if we have a token
+  const authHeaders = useMemo<HeadersInit | undefined>(
+    () =>
+      token
+        ? {
+            authorization: `Bearer ${token}`,
+            'content-type': 'application/json',
+          }
+        : undefined,
     [token]
   );
 
@@ -35,11 +43,11 @@ export default function AccountsPage() {
   const [newChildrenCovered, setNewChildrenCovered] = useState<number>(1);
 
   const fetchAccounts = async () => {
-    if (!token) return;
+    if (!authHeaders) return;
     setLoading(true);
     setError(null);
     try {
-      const r = await fetch('/api/accounts', { headers });
+      const r = await fetch('/api/accounts', { headers: authHeaders });
       const j = await r.json();
       if (!j?.ok) throw new Error(j?.error ?? 'Failed to load accounts');
       setItems(j.items ?? []);
@@ -55,9 +63,10 @@ export default function AccountsPage() {
 
   useEffect(() => {
     fetchAccounts();
-  }, [token]);
+  }, [authHeaders]);
 
   const addAccount = async () => {
+    if (!authHeaders) return;
     try {
       const payload: any = {
         name: newName.trim(),
@@ -70,7 +79,7 @@ export default function AccountsPage() {
       }
       const r = await fetch('/api/accounts', {
         method: 'POST',
-        headers,
+        headers: authHeaders,
         body: JSON.stringify(payload),
       });
       const j = await r.json();
@@ -87,10 +96,11 @@ export default function AccountsPage() {
   };
 
   const saveLine = async (a: Account) => {
+    if (!authHeaders) return;
     try {
       const r = await fetch(`/api/accounts/${a.id}`, {
         method: 'PATCH',
-        headers,
+        headers: authHeaders,
         body: JSON.stringify({
           name: a.name,
           type: a.type,
@@ -108,8 +118,9 @@ export default function AccountsPage() {
   };
 
   const deleteLine = async (id: string) => {
+    if (!authHeaders) return;
     try {
-      const r = await fetch(`/api/accounts/${id}`, { method: 'DELETE', headers });
+      const r = await fetch(`/api/accounts/${id}`, { method: 'DELETE', headers: authHeaders });
       const j = await r.json();
       if (!j?.ok) throw new Error(j?.error ?? 'Delete failed');
       await fetchAccounts();
