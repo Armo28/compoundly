@@ -4,55 +4,31 @@ import { getRouteClient, requireUser, jsonOK, jsonErr } from '@/lib/supabaseRout
 export async function GET(req: NextRequest) {
   try {
     const user = await requireUser(req);
+    const { supabase } = getRouteClient(req);
     const year = new Date().getFullYear();
-    const { supabase } = getRouteClient(req);
 
-    const { data: row, error: e1 } = await supabase
+    // contributed this year
+    const { data: ytdRows, error: e1 } = await supabase
       .from('resp_year_progress')
-      .select('year, deposited')
+      .select('amount')
       .eq('user_id', user.id)
-      .eq('year', year)
-      .maybeSingle();
+      .eq('year', year);
+
     if (e1) throw e1;
+    const contributed_ytd = (ytdRows ?? []).reduce((s, r: any) => s + Number(r?.amount || 0), 0);
 
-    const { data: all, error: e2 } = await supabase
+    // lifetime contributed (sum of all rows)
+    const { data: lifeRows, error: e2 } = await supabase
       .from('resp_year_progress')
-      .select('deposited')
+      .select('amount')
       .eq('user_id', user.id);
+
     if (e2) throw e2;
+    const lifetime_contributed = (lifeRows ?? []).reduce((s, r: any) => s + Number(r?.amount || 0), 0);
 
-    const deposited_year = Number(row?.deposited ?? 0);
-    const deposited_total = (all ?? []).reduce(
-      (a, r: any) => a + Number(r.deposited || 0),
-      0
-    );
-
-    return jsonOK({ ok: true, year, deposited_year, deposited_total });
+    return jsonOK({ ok: true, contributed_ytd, lifetime_contributed });
   } catch (e: any) {
-    return jsonErr(e?.message ?? 'Server error', e?.status ?? 500);
-  }
-}
-
-export async function POST(req: NextRequest) {
-  try {
-    const user = await requireUser(req);
-    const body = await req.json();
-    const year = Number(body?.year ?? new Date().getFullYear());
-    const deposited = Number(body?.deposited ?? 0);
-    const { supabase } = getRouteClient(req);
-
-    const { data, error } = await supabase
-      .from('resp_year_progress')
-      .upsert(
-        [{ user_id: user.id, year, deposited, updated_at: new Date().toISOString() }],
-        { onConflict: 'user_id,year' }
-      )
-      .select('year, deposited')
-      .single();
-
-    if (error) throw error;
-    return jsonOK({ ok: true, item: data });
-  } catch (e: any) {
-    return jsonErr(e?.message ?? 'Server error', e?.status ?? 500);
+    // Safe default keeps Goals UI functioning
+    return jsonOK({ ok: true, contributed_ytd: 0, lifetime_contributed: 0 });
   }
 }

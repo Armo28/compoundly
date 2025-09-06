@@ -3,299 +3,224 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useAuth } from '@/lib/auth';
 
-type Account = {
+type Item = {
   id: string;
-  name: string;
-  type: string;
+  name: string;            // institution
+  type: string;            // TFSA | RRSP | RESP | Margin...
   balance: number;
   is_family_resp?: boolean;
   children_covered?: number;
 };
 
-const TYPES = ['TFSA', 'RRSP', 'RESP', 'LIRA', 'Margin', 'Other'] as const;
+const TYPES = ['TFSA', 'RRSP', 'RESP', 'Margin'];
 
 export default function AccountsPage() {
   const { session } = useAuth();
   const token = session?.access_token ?? '';
 
-  // EXPLICIT: only defined if we have a token
-  const authHeaders = useMemo<HeadersInit | undefined>(
-    () =>
-      token
-        ? {
-            authorization: `Bearer ${token}`,
-            'content-type': 'application/json',
-          }
-        : undefined,
-    [token]
-  );
+  const headers: HeadersInit = token ? { authorization: `Bearer ${token}`, 'content-type': 'application/json' } : {};
 
-  const [items, setItems] = useState<Account[]>([]);
-  const [drafts, setDrafts] = useState<Record<string, Account>>({});
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [items, setItems] = useState<Item[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState<string | null>(null);
 
   // add form
-  const [newName, setNewName] = useState('');
-  const [newType, setNewType] = useState<(typeof TYPES)[number]>('TFSA');
-  const [newBalance, setNewBalance] = useState<number | ''>('');
-  const [newIsFamilyResp, setNewIsFamilyResp] = useState(false);
-  const [newChildrenCovered, setNewChildrenCovered] = useState<number>(1);
+  const [addName, setAddName] = useState('');
+  const [addType, setAddType] = useState('TFSA');
+  const [addBal, setAddBal] = useState<number>(0);
 
-  const fetchAccounts = async () => {
-    if (!authHeaders) return;
+  const load = async () => {
+    setErr(null);
     setLoading(true);
-    setError(null);
     try {
-      const r = await fetch('/api/accounts', { headers: authHeaders });
+      const r = await fetch('/api/accounts', { headers });
       const j = await r.json();
       if (!j?.ok) throw new Error(j?.error ?? 'Failed to load accounts');
       setItems(j.items ?? []);
-      const map: Record<string, Account> = {};
-      for (const it of j.items ?? []) map[it.id] = { ...it };
-      setDrafts(map);
     } catch (e: any) {
-      setError(e?.message ?? 'Failed to load accounts');
+      setErr(e?.message ?? 'Error');
     } finally {
       setLoading(false);
     }
   };
 
-  useEffect(() => {
-    fetchAccounts();
-  }, [authHeaders]);
+  useEffect(() => { if (token) load(); }, [token]); // eslint-disable-line
 
-  const addAccount = async () => {
-    if (!authHeaders) return;
+  const add = async () => {
     try {
-      const payload: any = {
-        name: newName.trim(),
-        type: newType,
-        balance: Number(newBalance || 0),
-      };
-      if (newType.toUpperCase() === 'RESP') {
-        payload.is_family_resp = newIsFamilyResp;
-        payload.children_covered = Math.max(1, Number(newChildrenCovered || 1));
-      }
       const r = await fetch('/api/accounts', {
         method: 'POST',
-        headers: authHeaders,
-        body: JSON.stringify(payload),
+        headers,
+        body: JSON.stringify({ name: addName.trim(), type: addType, balance: Number(addBal) }),
       });
       const j = await r.json();
       if (!j?.ok) throw new Error(j?.error ?? 'Add failed');
-      await fetchAccounts();
-      setNewName('');
-      setNewType('TFSA');
-      setNewBalance('');
-      setNewIsFamilyResp(false);
-      setNewChildrenCovered(1);
-    } catch (e: any) {
-      setError(e?.message ?? 'Add failed');
-    }
+      setAddName(''); setAddBal(0); setAddType('TFSA');
+      await load();
+    } catch (e: any) { setErr(e?.message ?? 'Add failed'); }
   };
 
-  const saveLine = async (a: Account) => {
-    if (!authHeaders) return;
+  const save = async (row: Item) => {
     try {
-      const r = await fetch(`/api/accounts/${a.id}`, {
+      const r = await fetch(`/api/accounts/${row.id}`, {
         method: 'PATCH',
-        headers: authHeaders,
+        headers,
         body: JSON.stringify({
-          name: a.name,
-          type: a.type,
-          balance: a.balance,
-          is_family_resp: !!a.is_family_resp,
-          children_covered: Math.max(1, Number(a.children_covered || 1)),
+          name: row.name,
+          type: row.type,
+          balance: row.balance,
+          is_family_resp: !!row.is_family_resp,
+          children_covered: Math.max(1, Number(row.children_covered || 1)),
         }),
       });
       const j = await r.json();
       if (!j?.ok) throw new Error(j?.error ?? 'Save failed');
-      await fetchAccounts();
-    } catch (e: any) {
-      setError(e?.message ?? 'Save failed');
-    }
+      await load();
+    } catch (e: any) { setErr(e?.message ?? 'Save failed'); }
   };
 
-  const deleteLine = async (id: string) => {
-    if (!authHeaders) return;
+  const del = async (id: string) => {
     try {
-      const r = await fetch(`/api/accounts/${id}`, { method: 'DELETE', headers: authHeaders });
+      const r = await fetch(`/api/accounts/${id}`, { method: 'DELETE', headers });
       const j = await r.json();
       if (!j?.ok) throw new Error(j?.error ?? 'Delete failed');
-      await fetchAccounts();
-    } catch (e: any) {
-      setError(e?.message ?? 'Delete failed');
-    }
-  };
-
-  const changed = (id: string) => {
-    const d = drafts[id];
-    const o = items.find((x) => x.id === id);
-    return JSON.stringify(d) !== JSON.stringify(o);
+      await load();
+    } catch (e: any) { setErr(e?.message ?? 'Delete failed'); }
   };
 
   return (
-    <main className="max-w-6xl mx-auto p-4 space-y-6">
+    <main className="max-w-6xl mx-auto p-4 space-y-4">
+      {/* Add account */}
       <section className="rounded-2xl border bg-white p-4 shadow-sm">
-        <div className="text-sm font-medium mb-2">Add account</div>
-        <div className="grid grid-cols-12 gap-3 items-center">
+        <div className="text-sm font-medium mb-3">Add account</div>
+        <div className="grid grid-cols-12 gap-3">
           <input
-            className="col-span-4 rounded border px-3 py-2"
+            value={addName}
+            onChange={(e) => setAddName(e.target.value)}
             placeholder="Institution (e.g., BMO)"
-            value={newName}
-            onChange={(e) => setNewName(e.target.value)}
+            className="col-span-12 sm:col-span-5 rounded-lg border px-3 py-2"
           />
           <select
-            className="col-span-2 rounded border px-3 py-2"
-            value={newType}
-            onChange={(e) => setNewType(e.target.value as any)}
+            value={addType}
+            onChange={(e) => setAddType(e.target.value)}
+            className="col-span-6 sm:col-span-3 rounded-lg border px-3 py-2"
           >
-            {TYPES.map((t) => (
-              <option key={t} value={t}>
-                {t}
-              </option>
-            ))}
+            {TYPES.map((t) => <option key={t}>{t}</option>)}
           </select>
           <input
-            className="col-span-2 rounded border px-3 py-2"
-            placeholder="Balance"
             type="number"
-            min={0}
-            value={newBalance}
-            onChange={(e) => setNewBalance(e.target.value === '' ? '' : Number(e.target.value))}
+            value={addBal}
+            onChange={(e) => setAddBal(Number(e.target.value))}
+            placeholder="Balance"
+            className="col-span-6 sm:col-span-2 rounded-lg border px-3 py-2"
           />
-          {newType.toUpperCase() === 'RESP' && (
-            <>
-              <label className="col-span-2 flex items-center gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  checked={newIsFamilyResp}
-                  onChange={(e) => setNewIsFamilyResp(e.target.checked)}
-                />
-                Family RESP
-              </label>
-              <div className="col-span-2 flex items-center gap-2">
-                <span className="text-sm">Children covered</span>
-                <input
-                  type="number"
-                  min={1}
-                  className="w-20 rounded border px-2 py-2"
-                  value={newChildrenCovered}
-                  onChange={(e) => setNewChildrenCovered(Math.max(1, Number(e.target.value || 1)))}
-                />
-              </div>
-            </>
-          )}
-          <div className="col-span-2 flex justify-end">
-            <button onClick={addAccount} className="rounded bg-indigo-600 px-4 py-2 text-white">
+          <div className="col-span-12 sm:col-span-2 flex items-center">
+            <button onClick={add} className="w-full rounded bg-indigo-600 px-4 py-2 text-white">
               Add
             </button>
           </div>
         </div>
-        <div className="mt-2 text-xs text-gray-500">
+        <div className="text-xs text-gray-500 mt-2">
           Tip: balances can be updated anytime; Save becomes clickable only when a change is made.
         </div>
       </section>
 
+      {/* Your accounts */}
       <section className="rounded-2xl border bg-white p-4 shadow-sm">
-        <div className="text-sm font-medium mb-2">Your accounts</div>
-        {error && <div className="text-red-600 text-sm mb-3">{error}</div>}
+        <div className="text-sm font-medium mb-3">Your accounts</div>
+        {err && <div className="text-red-600 text-sm mb-2">{err}</div>}
         {loading ? (
-          <div className="text-sm text-gray-600">Loading…</div>
+          <div className="text-gray-600 text-sm">Loading…</div>
         ) : (
           <div className="space-y-3">
-            {items.map((a) => {
-              const d = drafts[a.id];
+            {items.map((row, idx) => {
+              const isRESP = String(row.type).toUpperCase() === 'RESP';
               return (
-                <div key={a.id} className="grid grid-cols-12 items-center gap-3 rounded border p-3">
+                <div key={row.id} className="grid grid-cols-12 gap-3 items-center">
+                  {/* Institution */}
                   <input
-                    className="col-span-4 rounded border px-3 py-2"
-                    value={d?.name ?? ''}
-                    onChange={(e) =>
-                      setDrafts((m) => ({ ...m, [a.id]: { ...m[a.id], name: e.target.value } }))
-                    }
+                    value={row.name}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      setItems((cur) => cur.map((it, i) => (i === idx ? { ...it, name: v } : it)));
+                    }}
+                    className="col-span-12 sm:col-span-4 rounded-lg border px-3 py-2"
                   />
+
+                  {/* Type */}
                   <select
-                    className="col-span-2 rounded border px-3 py-2"
-                    value={d?.type ?? 'TFSA'}
-                    onChange={(e) =>
-                      setDrafts((m) => ({
-                        ...m,
-                        [a.id]: { ...m[a.id], type: e.target.value.toUpperCase() },
-                      }))
-                    }
+                    value={row.type}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      setItems((cur) => cur.map((it, i) => (i === idx ? { ...it, type: v } : it)));
+                    }}
+                    className="col-span-6 sm:col-span-2 rounded-lg border px-3 py-2"
                   >
-                    {TYPES.map((t) => (
-                      <option key={t} value={t}>
-                        {t}
-                      </option>
-                    ))}
+                    {TYPES.map((t) => <option key={t}>{t}</option>)}
                   </select>
+
+                  {/* Balance */}
                   <input
-                    className="col-span-2 rounded border px-3 py-2"
                     type="number"
-                    min={0}
-                    value={d?.balance ?? 0}
-                    onChange={(e) =>
-                      setDrafts((m) => ({
-                        ...m,
-                        [a.id]: { ...m[a.id], balance: Number(e.target.value || 0) },
-                      }))
-                    }
+                    value={row.balance ?? 0}
+                    onChange={(e) => {
+                      const v = Number(e.target.value);
+                      setItems((cur) => cur.map((it, i) => (i === idx ? { ...it, balance: v } : it)));
+                    }}
+                    className="col-span-6 sm:col-span-2 rounded-lg border px-3 py-2"
                   />
-                  {String(d?.type).toUpperCase() === 'RESP' ? (
-                    <>
-                      <label className="col-span-2 flex items-center gap-2 text-sm">
-                        <input
-                          type="checkbox"
-                          checked={!!d?.is_family_resp}
-                          onChange={(e) =>
-                            setDrafts((m) => ({
-                              ...m,
-                              [a.id]: { ...m[a.id], is_family_resp: e.target.checked },
-                            }))
-                          }
-                        />
-                        Family RESP
-                      </label>
-                      <div className="col-span-1 flex items-center gap-2">
-                        <span className="text-sm">Kids</span>
-                        <input
-                          type="number"
-                          min={1}
-                          className="w-16 rounded border px-2 py-2"
-                          value={Number(d?.children_covered || 1)}
-                          onChange={(e) =>
-                            setDrafts((m) => ({
-                              ...m,
-                              [a.id]: {
-                                ...m[a.id],
-                                children_covered: Math.max(1, Number(e.target.value || 1)),
-                              },
-                            }))
-                          }
-                        />
-                      </div>
-                    </>
-                  ) : (
-                    <div className="col-span-3" />
-                  )}
-                  <div className="col-span-1 flex justify-end gap-2">
+
+                  {/* Family RESP + kids (only when RESP) */}
+                  <div className="col-span-12 sm:col-span-2 flex items-center gap-3">
+                    {isRESP && (
+                      <>
+                        <label className="inline-flex items-center gap-2 text-sm">
+                          <input
+                            type="checkbox"
+                            checked={!!row.is_family_resp}
+                            onChange={(e) => {
+                              const v = e.target.checked;
+                              setItems((cur) => cur.map((it, i) =>
+                                i === idx ? { ...it, is_family_resp: v } : it
+                              ));
+                            }}
+                          />
+                          Family RESP
+                        </label>
+                        <div className="flex items-center gap-1">
+                          <span className="text-sm text-gray-600">Kids</span>
+                          <input
+                            type="number"
+                            min={1}
+                            value={Math.max(1, Number(row.children_covered || 1))}
+                            onChange={(e) => {
+                              const v = Math.max(1, Number(e.target.value || 1));
+                              setItems((cur) => cur.map((it, i) =>
+                                i === idx ? { ...it, children_covered: v } : it
+                              ));
+                            }}
+                            className="w-20 rounded-lg border px-2 py-2"
+                          />
+                        </div>
+                      </>
+                    )}
+                  </div>
+
+                  {/* Actions (fixed width; prevents overlap) */}
+                  <div className="col-span-12 sm:col-span-2 flex justify-end gap-2">
                     <button
-                      onClick={() => d && saveLine(d)}
-                      disabled={!changed(a.id)}
-                      className={
-                        changed(a.id)
-                          ? 'rounded bg-indigo-600 px-3 py-1.5 text-white'
-                          : 'rounded bg-gray-300 px-3 py-1.5 text-gray-600 cursor-not-allowed'
-                      }
+                      onClick={() => save({
+                        ...row,
+                        children_covered: isRESP ? Math.max(1, Number(row.children_covered || 1)) : undefined,
+                        is_family_resp: isRESP ? !!row.is_family_resp : undefined,
+                      })}
+                      className="rounded bg-gray-700 px-3 py-2 text-white"
                     >
                       Save
                     </button>
                     <button
-                      onClick={() => deleteLine(a.id)}
-                      className="rounded bg-red-500 px-3 py-1.5 text-white"
+                      onClick={() => del(row.id)}
+                      className="rounded bg-red-500 px-3 py-2 text-white"
                     >
                       Delete
                     </button>
