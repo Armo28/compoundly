@@ -1,4 +1,3 @@
-cat > src/app/api/resp-progress/route.ts <<'TS'
 import { NextRequest } from 'next/server';
 import { getRouteClient, requireUser, jsonOK, jsonErr } from '@/lib/supabaseRoute';
 
@@ -8,7 +7,7 @@ export async function GET(req: NextRequest) {
     const year = new Date().getFullYear();
     const { supabase } = getRouteClient(req);
 
-    const { data: y, error: e1 } = await supabase
+    const { data: row, error: e1 } = await supabase
       .from('resp_year_progress')
       .select('year, deposited')
       .eq('user_id', user.id)
@@ -16,14 +15,17 @@ export async function GET(req: NextRequest) {
       .maybeSingle();
     if (e1) throw e1;
 
-    const { data: rows, error: e2 } = await supabase
+    const { data: all, error: e2 } = await supabase
       .from('resp_year_progress')
       .select('deposited')
       .eq('user_id', user.id);
     if (e2) throw e2;
 
-    const deposited_year = y?.deposited ?? 0;
-    const deposited_total = (rows ?? []).reduce((a, r: any) => a + Number(r.deposited || 0), 0);
+    const deposited_year = Number(row?.deposited ?? 0);
+    const deposited_total = (all ?? []).reduce(
+      (a, r: any) => a + Number(r.deposited || 0),
+      0
+    );
 
     return jsonOK({ ok: true, year, deposited_year, deposited_total });
   } catch (e: any) {
@@ -54,4 +56,3 @@ export async function POST(req: NextRequest) {
     return jsonErr(e?.message ?? 'Server error', e?.status ?? 500);
   }
 }
-TS

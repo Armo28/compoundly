@@ -1,8 +1,10 @@
-cat > src/app/api/accounts/\[id]/route.ts <<'TS'
 import { NextRequest } from 'next/server';
 import { getRouteClient, requireUser, jsonOK, jsonErr } from '@/lib/supabaseRoute';
 
-export async function PATCH(req: NextRequest, { params }: { params: { id: string } }) {
+export async function PATCH(
+  req: NextRequest,
+  { params }: { params: { id: string } }
+) {
   try {
     const user = await requireUser(req);
     const { supabase } = getRouteClient(req);
@@ -12,7 +14,7 @@ export async function PATCH(req: NextRequest, { params }: { params: { id: string
     if (body.balance !== undefined) updates.balance = Number(body.balance);
     if (body.name !== undefined) updates.name = String(body.name).trim();
     if (body.type !== undefined) updates.type = String(body.type).toUpperCase();
-    if (body.is_family_resp !== undefined) updates.is_family_resp = Boolean(body.is_family_resp);
+    if (body.is_family_resp !== undefined) updates.is_family_resp = !!body.is_family_resp;
     if (body.children_covered !== undefined)
       updates.children_covered = Math.max(1, Number(body.children_covered));
 
@@ -31,7 +33,10 @@ export async function PATCH(req: NextRequest, { params }: { params: { id: string
   }
 }
 
-export async function DELETE(req: NextRequest, { params }: { params: { id: string } }) {
+export async function DELETE(
+  req: NextRequest,
+  { params }: { params: { id: string } }
+) {
   try {
     const user = await requireUser(req);
     const { supabase } = getRouteClient(req);
@@ -48,4 +53,3 @@ export async function DELETE(req: NextRequest, { params }: { params: { id: strin
     return jsonErr(e?.message ?? 'Server error', e?.status ?? 500);
   }
 }
-TS

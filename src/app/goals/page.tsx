@@ -1,4 +1,3 @@
-cat > src/app/goals/page.tsx <<'TS'
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -12,7 +11,6 @@ type Account = {
   is_family_resp?: boolean;
   children_covered?: number;
 };
-
 type RespProgress = { year: number; deposited_year: number; deposited_total: number };
 
 const CAD = (n: number) =>
@@ -41,10 +39,7 @@ function useLS<T>(key: string, initial: T) {
 export default function GoalsPage() {
   const { session } = useAuth();
   const token = session?.access_token ?? '';
-  const headers = useMemo(
-    () => (token ? { authorization: `Bearer ${token}` } : {}),
-    [token]
-  );
+  const headers = useMemo(() => (token ? { authorization: `Bearer ${token}` } : {}), [token]);
 
   const [pledge, setPledge] = useLS<number>('goals.pledge', 1000);
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -53,7 +48,10 @@ export default function GoalsPage() {
   // mic + notes
   const [isMicOn, setIsMicOn] = useState(false);
   const [text, setText] = useLS<string>('goals.text', '');
-  const [notes, setNotes] = useLS<Array<{ id: string; ts: string; text: string }>>('goals.notes', []);
+  const [notes, setNotes] = useLS<Array<{ id: string; ts: string; text: string }>>(
+    'goals.notes',
+    []
+  );
   const recRef = useRef<any>(null);
   const interimRef = useRef('');
 
@@ -70,19 +68,20 @@ export default function GoalsPage() {
     })();
   }, [token]);
 
-  // RESP visibility: any RESP account -> visible; compute total children covered
-  const childrenCovered = useMemo(() => {
-    return (accounts || [])
-      .filter((a) => String(a.type).toUpperCase() === 'RESP')
-      .reduce((sum, a) => {
-        const kids = a.is_family_resp ? Math.max(1, Number(a.children_covered || 1)) : 1;
-        return sum + kids;
-      }, 0);
-  }, [accounts]);
-
+  // RESP visibility + children covered
+  const childrenCovered = useMemo(
+    () =>
+      (accounts || [])
+        .filter((a) => String(a.type).toUpperCase() === 'RESP')
+        .reduce((sum, a) => {
+          const kids = a.is_family_resp ? Math.max(1, Number(a.children_covered || 1)) : 1;
+          return sum + kids;
+        }, 0),
+    [accounts]
+  );
   const hasResp = childrenCovered > 0;
 
-  // RESP remaining calc
+  // RESP remaining
   const monthsLeft = monthsLeftThisYear();
   const RESP_ANNUAL = 2500;
   const RESP_LIFETIME = 50000;
@@ -96,7 +95,7 @@ export default function GoalsPage() {
     childrenCovered * RESP_LIFETIME - Number(respProg?.deposited_total || 0)
   );
 
-  // TODO: plug in your existing TFSA/RRSP "rooms" fetch; placeholder 0 so RESP behavior is visible now
+  // TODO: plug real TFSA/RRSP rooms; placeholders for now
   const tfsaRemaining = 0;
   const rrspRemaining = 0;
 
@@ -116,12 +115,14 @@ export default function GoalsPage() {
     if (tfsaRemaining > 0 && left > 0) {
       const cap = Math.ceil(tfsaRemaining / monthsLeft);
       const amt = Math.min(left, cap);
-      out.tfsa = amt; left -= amt;
+      out.tfsa = amt;
+      left -= amt;
     }
     if (rrspRemaining > 0 && left > 0) {
       const cap = Math.ceil(rrspRemaining / monthsLeft);
       const amt = Math.min(left, cap);
-      out.rrsp = amt; left -= amt;
+      out.rrsp = amt;
+      left -= amt;
     }
 
     if (left > 0) out.margin = left;
@@ -131,13 +132,18 @@ export default function GoalsPage() {
   // mic
   const toggleMic = () => {
     if (isMicOn) {
-      try { recRef.current?.stop(); } catch {}
+      try {
+        recRef.current?.stop();
+      } catch {}
       recRef.current = null;
       setIsMicOn(false);
       return;
     }
     const SR: any = (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition;
-    if (!SR) { alert('Speech recognition not supported on this browser.'); return; }
+    if (!SR) {
+      alert('Speech recognition not supported on this browser.');
+      return;
+    }
     const rec = new SR();
     rec.lang = 'en-US';
     rec.continuous = true;
@@ -166,7 +172,6 @@ export default function GoalsPage() {
     setText('');
     interimRef.current = '';
   };
-  const deleteNote = (id: string) => setNotes((n) => n.filter((x) => x.id !== id));
 
   return (
     <main className="max-w-6xl mx-auto p-4 space-y-4">
@@ -229,10 +234,20 @@ export default function GoalsPage() {
             title={isMicOn ? 'Stop mic' : 'Start mic'}
           >
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
-              <path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Z"
-                stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-              <path d="M19 11a7 7 0 0 1-14 0M12 18v3"
-                stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+              <path
+                d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Z"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+              <path
+                d="M19 11a7 7 0 0 1-14 0M12 18v3"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
             </svg>
           </button>
           <button onClick={saveNote} className="rounded bg-indigo-600 px-3 py-2 text-white">
@@ -291,4 +306,3 @@ export default function GoalsPage() {
 function cryptoId() {
   return 'id-' + Math.random().toString(36).slice(2);
 }
-TS

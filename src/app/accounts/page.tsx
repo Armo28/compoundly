@@ -238,7 +238,7 @@ export default function AccountsPage() {
                       <label className="col-span-2 flex items-center gap-2 text-sm">
                         <input
                           type="checkbox"
-                          checked={Boolean(d?.is_family_resp)}
+                          checked={!!d?.is_family_resp}
                           onChange={(e) =>
                             setDrafts((m) => ({
                               ...m,
@@ -272,7 +272,7 @@ export default function AccountsPage() {
                   )}
                   <div className="col-span-1 flex justify-end gap-2">
                     <button
-                      onClick={() => saveLine(d!)}
+                      onClick={() => d && saveLine(d)}
                       disabled={!changed(a.id)}
                       className={
                         changed(a.id)
@@ -298,4 +298,3 @@ export default function AccountsPage() {
     </main>
   );
 }
-TS
