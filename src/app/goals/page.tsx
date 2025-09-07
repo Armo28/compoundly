@@ -15,11 +15,11 @@ type Account = {
 };
 
 type RespProgress = {
-  total_value: number;
-  lifetime_contrib: number;
-  contributed_this_year: number;
-  is_family_resp: boolean;
-  children_covered: number;
+  total_value?: number | null;
+  lifetime_contrib?: number | null;
+  contributed_this_year?: number | null;
+  is_family_resp?: boolean | null;
+  children_covered?: number | null;
 };
 
 const CAD = (n: number) =>
@@ -27,58 +27,41 @@ const CAD = (n: number) =>
 
 const monthsLeftThisYear = () => Math.max(1, 12 - new Date().getMonth());
 
-// ---------------- Core CESG math helpers ----------------
+// ---------------- CESG math helpers ----------------
 
 const PER_CHILD_LIFETIME_CONTRIB_CAP = 50_000;
-const PER_CHILD_LIFETIME_GRANT_CAP = 7_200;  // CESG lifetime
-const PER_CHILD_GRANTABLE_THIS_YEAR_MAX = 5_000; // 2,500 current + 2,500 catch-up potential
+const PER_CHILD_LIFETIME_GRANT_CAP = 7_200;
+const PER_CHILD_GRANTABLE_THIS_YEAR_MAX = 5_000;
 
-function clamp(n: number, lo: number, hi: number) {
-  return Math.max(lo, Math.min(hi, n));
-}
+const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
 
-/** Estimate remaining *grantable* contribution for this year across all children. */
-function computeGrantableRemainingThisYear(
-  children: number,
-  lifetimeContrib: number,       // total dollars contributed over life (all kids combined for family)
-  contributedThisYear: number    // total dollars contributed so far this year
-) {
+/** Remaining *grantable* contribution for this year across all children. O(1), no Array.from */
+function grantableRemainingThisYear(children: number, lifetimeContrib: number, contributedThisYear: number): number {
   if (children <= 0) return 0;
 
-  // Approximate per-child historical contributions by dividing lifetime_contrib
+  // Approximate per-child contributions uniformly.
   const perChildLifetimeContrib = lifetimeContrib / children;
+  const perChildGrantSoFar = clamp(0.2 * perChildLifetimeContrib, 0, PER_CHILD_LIFETIME_GRANT_CAP);
 
-  // Grants received so far per child (approx) capped at lifetime grant cap
-  const perChildGrantReceived = clamp(0.2 * perChildLifetimeContrib, 0, PER_CHILD_LIFETIME_GRANT_CAP);
-
-  // If a child has already reached lifetime grant cap, no grant path remains for that child
-  const grantableChildren = Math.round(
-    Array.from({ length: children }).reduce((acc) => acc + (perChildGrantReceived < PER_CHILD_LIFETIME_GRANT_CAP ? 1 : 0), 0)
-  );
+  // Uniform model ⇒ either all are still grant-eligible or none are.
+  const grantableChildren = perChildGrantSoFar < PER_CHILD_LIFETIME_GRANT_CAP ? children : 0;
   if (grantableChildren === 0) return 0;
 
-  // Max that can be grant-eligible this year across these children
-  const yearMax = grantableChildren * PER_CHILD_GRANTABLE_THIS_YEAR_MAX;
-
-  // We credit any dollars already contributed this year *first* against the grant path (best effort)
-  const usedAgainstGrant = clamp(contributedThisYear, 0, yearMax);
-
-  return Math.max(0, yearMax - usedAgainstGrant);
+  const yearMaxAllKids = grantableChildren * PER_CHILD_GRANTABLE_THIS_YEAR_MAX;
+  const usedAgainstGrant = clamp(contributedThisYear, 0, yearMaxAllKids);
+  return Math.max(0, yearMaxAllKids - usedAgainstGrant);
 }
 
-/** Remaining lifetime contribution capacity (total dollars) */
-function computeRespLifetimeContributionRemaining(children: number, lifetimeContrib: number) {
+function respLifetimeRemaining(children: number, lifetimeContrib: number): number {
   return Math.max(0, children * PER_CHILD_LIFETIME_CONTRIB_CAP - lifetimeContrib);
 }
 
-/** Whether lifetime CESG has already been fully achieved (approx) */
-function cesgLifetimeReached(children: number, lifetimeContrib: number) {
-  // Approx per-child grant so far
+function cesgLifetimeReached(children: number, lifetimeContrib: number): boolean {
   const perChildGrant = clamp(0.2 * (lifetimeContrib / Math.max(1, children)), 0, PER_CHILD_LIFETIME_GRANT_CAP);
   return perChildGrant >= PER_CHILD_LIFETIME_GRANT_CAP;
 }
 
-// -------------------------------------------------------
+// ---------------------------------------------------
 
 export default function GoalsPage() {
   const { session } = useAuth();
@@ -95,7 +78,7 @@ export default function GoalsPage() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [resp, setResp] = useState<RespProgress | null>(null);
 
-  // mic + notes (kept minimal; icon-only button)
+  // mic + notes (icon-only)
   const [isMicOn, setIsMicOn] = useState(false);
   const [text, setText] = useState('');
   const recRef = useRef<any>(null);
@@ -136,13 +119,11 @@ export default function GoalsPage() {
     recRef.current = rec; rec.start(); setIsMicOn(true);
   };
 
-  // fetch everything
+  // fetch
   useEffect(() => {
     if (!token) return;
-
     (async () => {
       try {
-        // rooms
         const r1 = await fetch('/api/rooms', { headers: authHeaders });
         const j1 = await r1.json();
         const room = j1?.room ?? j1?.data ?? null;
@@ -150,14 +131,12 @@ export default function GoalsPage() {
       } catch {}
 
       try {
-        // accounts
         const r2 = await fetch('/api/accounts', { headers: authHeaders });
         const j2 = await r2.json();
         if (Array.isArray(j2?.items)) setAccounts(j2.items as Account[]);
       } catch {}
 
       try {
-        // resp progress
         const r3 = await fetch('/api/resp-progress', { headers: authHeaders });
         const j3 = await r3.json();
         if (j3?.ok && j3?.data) {
@@ -167,25 +146,23 @@ export default function GoalsPage() {
             lifetime_contrib: Number(d.lifetime_contrib ?? 0),
             contributed_this_year: Number(d.contributed_this_year ?? 0),
             is_family_resp: !!d.is_family_resp,
-            children_covered: Math.max(1, Number(d.children_covered ?? 1)),
+            children_covered: Number(d.children_covered ?? 1),
           });
         }
       } catch {}
     })();
   }, [token]);
 
-  // derive RESP visibility & child count
+  // RESP visibility & children
   const hasRespAccount = useMemo(
     () => accounts.some(a => (a.type || '').toUpperCase() === 'RESP'),
     [accounts]
   );
 
   const respChildren = useMemo(() => {
-    if (resp) return Math.max(1, resp.children_covered || 1);
-    // If no resp progress row yet: infer 1 child if a non-family RESP exists
+    if (resp) return Math.max(1, Number(resp.children_covered || 1));
     const respLines = accounts.filter(a => (a.type || '').toUpperCase() === 'RESP');
     if (respLines.length === 0) return 0;
-    // we only store children_covered for family; otherwise assume 1
     const anyFamily = respLines.some(a => !!a.is_family_resp);
     const kids = respLines.reduce((acc, a) => acc + (a.is_family_resp ? Math.max(1, Number(a.children_covered || 1)) : 1), 0);
     return anyFamily ? Math.max(1, kids) : 1;
@@ -193,22 +170,26 @@ export default function GoalsPage() {
 
   const showRespTile = hasRespAccount || !!resp;
 
-  // remaining rooms (TFSA/RRSP) – from contribution room minus nothing we can compute here (you track deposits elsewhere)
+  // remaining rooms
   const tfsaRemaining = Math.max(0, Number(rooms?.tfsa ?? 0));
   const rrspRemaining = Math.max(0, Number(rooms?.rrsp ?? 0));
 
-  // RESP remaining – grant path & lifetime
-  const respGrantRemainingThisYear = useMemo(() => {
+  // RESP remaining (grant path + lifetime)
+  const grantRem = useMemo(() => {
     if (!respChildren || !resp) return 0;
-    return computeGrantableRemainingThisYear(respChildren, resp.lifetime_contrib, resp.contributed_this_year);
+    return grantableRemainingThisYear(
+      respChildren,
+      Number(resp.lifetime_contrib || 0),
+      Number(resp.contributed_this_year || 0)
+    );
   }, [respChildren, resp]);
 
-  const respLifetimeRemaining = useMemo(() => {
+  const lifetimeRem = useMemo(() => {
     if (!respChildren || !resp) return 0;
-    return computeRespLifetimeContributionRemaining(respChildren, resp.lifetime_contrib);
+    return respLifetimeRemaining(respChildren, Number(resp.lifetime_contrib || 0));
   }, [respChildren, resp]);
 
-  // Split monthly pledge with CESG-first → TFSA → RRSP → RESP (to lifetime) → Margin
+  // Pledge split
   const monthsLeft = monthsLeftThisYear();
   const capPerMonth = (room: number) => Math.ceil(room / monthsLeft);
 
@@ -216,14 +197,11 @@ export default function GoalsPage() {
     let left = pledge;
     const out = { resp: 0, tfsa: 0, rrsp: 0, margin: 0 };
 
-    // 1) RESP grant path (only if any grant still possible)
-    if (respGrantRemainingThisYear > 0) {
-      const amt = Math.min(left, capPerMonth(respGrantRemainingThisYear));
+    // 1) RESP grant path
+    if (grantRem > 0) {
+      const amt = Math.min(left, capPerMonth(grantRem));
       out.resp += amt; left -= amt;
     }
-
-    // If lifetime CESG already reached (for all children), TFSA gets priority before more RESP
-    const grantDone = respChildren > 0 && resp ? cesgLifetimeReached(respChildren, resp.lifetime_contrib) : false;
 
     // 2) TFSA, 3) RRSP
     if (tfsaRemaining > 0) {
@@ -235,26 +213,17 @@ export default function GoalsPage() {
       out.rrsp += amt; left -= amt;
     }
 
-    // 4) RESP leftover to lifetime cap (only if lifetime cap not reached)
-    if (!grantDone && respLifetimeRemaining > 0 && left > 0) {
-      const amt = Math.min(left, capPerMonth(respLifetimeRemaining));
-      out.resp += amt; left -= amt;
-    } else if (grantDone && left > 0 && respLifetimeRemaining > 0) {
-      // If CESG done but lifetime room exists, place RESP after TFSA/RRSP as per your rule
-      const amt = Math.min(left, capPerMonth(respLifetimeRemaining));
+    // 4) RESP to lifetime cap
+    if (lifetimeRem > 0 && left > 0) {
+      const amt = Math.min(left, capPerMonth(lifetimeRem));
       out.resp += amt; left -= amt;
     }
 
-    // 5) Margin/Other
+    // 5) Margin
     if (left > 0) out.margin = left;
 
     return out;
-  }, [
-    pledge, monthsLeft,
-    tfsaRemaining, rrspRemaining,
-    respGrantRemainingThisYear, respLifetimeRemaining,
-    respChildren, resp
-  ]);
+  }, [pledge, monthsLeft, grantRem, tfsaRemaining, rrspRemaining, lifetimeRem]);
 
   return (
     <main className="max-w-6xl mx-auto p-4 space-y-4">
@@ -274,12 +243,12 @@ export default function GoalsPage() {
           />
         </div>
         <div className="mt-2 text-xs text-gray-500">
-          Recommendation is specific to {new Date().toLocaleString(undefined, { month: 'long', year: 'numeric' })} ({monthsLeft}{' '}
-          {monthsLeft === 1 ? 'month' : 'months'} left this year).
+          Recommendation is specific to {new Date().toLocaleString(undefined, { month: 'long', year: 'numeric' })}{' '}
+          ({monthsLeft} {monthsLeft === 1 ? 'month' : 'months'} left this year).
         </div>
       </section>
 
-      {/* Recommendation tiles */}
+      {/* Tiles */}
       <section className="rounded-2xl border bg-white p-4 shadow-sm">
         <div className="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-4 gap-3">
           {showRespTile && (
@@ -287,11 +256,11 @@ export default function GoalsPage() {
               <div className="text-xs text-gray-600 mb-1">RESP</div>
               <div className="text-2xl font-semibold">{CAD(split.resp)}</div>
               <div className="text-[11px] text-gray-500 mt-1">
-                Grant path remaining (this year): {CAD(respGrantRemainingThisYear)}
+                Grant path remaining (this year): {CAD(grantRem)}
               </div>
               {resp && (
                 <div className="text-[11px] text-gray-500">
-                  Lifetime contribution room left: {CAD(respLifetimeRemaining)}
+                  Lifetime contribution room left: {CAD(lifetimeRem)}
                 </div>
               )}
             </div>
@@ -331,9 +300,7 @@ export default function GoalsPage() {
               <path d="M19 11a7 7 0 0 1-14 0M12 18v3" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
             </svg>
           </button>
-          <button className="rounded bg-indigo-600 px-3 py-2 text-white" onClick={() => {/* note save kept lightweight */}}>
-            Save note
-          </button>
+          <button className="rounded bg-indigo-600 px-3 py-2 text-white">Save note</button>
         </div>
         <textarea
           value={text}
