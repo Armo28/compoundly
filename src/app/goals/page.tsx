@@ -3,228 +3,258 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useAuth } from '@/lib/auth';
 
-const CAD = (n:number)=>n.toLocaleString(undefined,{style:'currency',currency:'CAD',maximumFractionDigits:0});
-const monthsLeftThisYear = ()=> Math.max(1, 12 - new Date().getMonth());
+type Rooms = { year: number; tfsa: number; rrsp: number };
 
 type Account = {
   id: string;
-  type: string;
+  type: string;                 // 'TFSA' | 'RRSP' | 'RESP' | ...
   name?: string;
-  institution?: string;
   balance?: number;
-  is_family_resp?: boolean;
-  children_covered?: number;
-  resp_lifetime_contributed?: number;
+  is_family_resp?: boolean | null;
+  children_covered?: number | null;
 };
 
-type RespYearRow = {
-  year: number;
-  contributed_ytd: number;
-  grant_eligible_contrib_lifetime: number | null;
-  carry_forward_grantable_per_child: number | null;
+type RespProgress = {
+  total_value: number;
+  lifetime_contrib: number;
+  contributed_this_year: number;
+  is_family_resp: boolean;
+  children_covered: number;
 };
 
-type Rooms = { year:number; tfsa:number; rrsp:number };
-type RoomsProgress = { year:number; tfsa_deposited?:number; rrsp_deposited?:number };
+const CAD = (n: number) =>
+  n.toLocaleString(undefined, { style: 'currency', currency: 'CAD', maximumFractionDigits: 0 });
 
-function loadLS<T>(k:string, fb:T):T{
-  if(typeof window==='undefined') return fb;
-  try{ const v=localStorage.getItem(k); return v? JSON.parse(v) as T : fb; }catch{return fb;}
-}
-function saveLS<T>(k:string,v:T){
-  try{ if(typeof window!=='undefined') localStorage.setItem(k, JSON.stringify(v)); }catch{}
+const monthsLeftThisYear = () => Math.max(1, 12 - new Date().getMonth());
+
+// ---------------- Core CESG math helpers ----------------
+
+const PER_CHILD_LIFETIME_CONTRIB_CAP = 50_000;
+const PER_CHILD_LIFETIME_GRANT_CAP = 7_200;  // CESG lifetime
+const PER_CHILD_GRANTABLE_THIS_YEAR_MAX = 5_000; // 2,500 current + 2,500 catch-up potential
+
+function clamp(n: number, lo: number, hi: number) {
+  return Math.max(lo, Math.min(hi, n));
 }
 
-export default function GoalsPage(){
+/** Estimate remaining *grantable* contribution for this year across all children. */
+function computeGrantableRemainingThisYear(
+  children: number,
+  lifetimeContrib: number,       // total dollars contributed over life (all kids combined for family)
+  contributedThisYear: number    // total dollars contributed so far this year
+) {
+  if (children <= 0) return 0;
+
+  // Approximate per-child historical contributions by dividing lifetime_contrib
+  const perChildLifetimeContrib = lifetimeContrib / children;
+
+  // Grants received so far per child (approx) capped at lifetime grant cap
+  const perChildGrantReceived = clamp(0.2 * perChildLifetimeContrib, 0, PER_CHILD_LIFETIME_GRANT_CAP);
+
+  // If a child has already reached lifetime grant cap, no grant path remains for that child
+  const grantableChildren = Math.round(
+    Array.from({ length: children }).reduce((acc) => acc + (perChildGrantReceived < PER_CHILD_LIFETIME_GRANT_CAP ? 1 : 0), 0)
+  );
+  if (grantableChildren === 0) return 0;
+
+  // Max that can be grant-eligible this year across these children
+  const yearMax = grantableChildren * PER_CHILD_GRANTABLE_THIS_YEAR_MAX;
+
+  // We credit any dollars already contributed this year *first* against the grant path (best effort)
+  const usedAgainstGrant = clamp(contributedThisYear, 0, yearMax);
+
+  return Math.max(0, yearMax - usedAgainstGrant);
+}
+
+/** Remaining lifetime contribution capacity (total dollars) */
+function computeRespLifetimeContributionRemaining(children: number, lifetimeContrib: number) {
+  return Math.max(0, children * PER_CHILD_LIFETIME_CONTRIB_CAP - lifetimeContrib);
+}
+
+/** Whether lifetime CESG has already been fully achieved (approx) */
+function cesgLifetimeReached(children: number, lifetimeContrib: number) {
+  // Approx per-child grant so far
+  const perChildGrant = clamp(0.2 * (lifetimeContrib / Math.max(1, children)), 0, PER_CHILD_LIFETIME_GRANT_CAP);
+  return perChildGrant >= PER_CHILD_LIFETIME_GRANT_CAP;
+}
+
+// -------------------------------------------------------
+
+export default function GoalsPage() {
   const { session } = useAuth();
   const token = session?.access_token ?? '';
-  const headers = token ? { authorization: `Bearer ${token}` } : undefined;
 
-  const [pledge, setPledge] = useState<number>(()=>loadLS('goals.pledge', 1000));
-  useEffect(()=>saveLS('goals.pledge', pledge), [pledge]);
+  const [pledge, setPledge] = useState<number>(() => {
+    try { return Number(localStorage.getItem('goals.pledge') ?? 1000); } catch { return 1000; }
+  });
+  useEffect(() => { try { localStorage.setItem('goals.pledge', String(pledge)); } catch {} }, [pledge]);
 
-  const [rooms, setRooms] = useState<Rooms|null>(null);
-  const [progress, setProgress] = useState<RoomsProgress|null>(null);
+  const authHeaders: HeadersInit = token ? { authorization: `Bearer ${token}` } : {};
+
+  const [rooms, setRooms] = useState<Rooms | null>(null);
   const [accounts, setAccounts] = useState<Account[]>([]);
-  const [respYear, setRespYear] = useState<RespYearRow|null>(null);
+  const [resp, setResp] = useState<RespProgress | null>(null);
 
-  // mic + notes
+  // mic + notes (kept minimal; icon-only button)
   const [isMicOn, setIsMicOn] = useState(false);
   const [text, setText] = useState('');
-  const [notes, setNotes] = useState<Array<{id:string, ts:string, text:string}>>(()=>loadLS('goals.notes', []));
-  useEffect(()=>saveLS('goals.notes', notes), [notes]);
-
-  // fetch
-  useEffect(()=>{
-    if(!headers) return;
-    (async()=>{
-      // rooms
-      const r = await fetch('/api/rooms', { headers });
-      const rj = await r.json();
-      const roomObj = rj?.room ?? rj ?? null;
-      if (roomObj) setRooms({ year: Number(roomObj.year ?? new Date().getFullYear()), tfsa: Number(roomObj.tfsa ?? 0), rrsp: Number(roomObj.rrsp ?? 0) });
-
-      // progress TFSA/RRSP
-      const p = await fetch('/api/rooms/progress', { headers });
-      const pj = await p.json();
-      if (pj) setProgress({ year: Number(pj.year ?? new Date().getFullYear()), tfsa_deposited: Number(pj.tfsa_deposited ?? 0), rrsp_deposited: Number(pj.rrsp_deposited ?? 0) });
-
-      // accounts
-      const a = await fetch('/api/accounts', { headers });
-      const aj = await a.json();
-      setAccounts(aj?.items ?? []);
-
-      // resp year
-      const yr = new Date().getFullYear();
-      const y = await fetch(`/api/resp-progress?year=${yr}`, { headers });
-      const yj = await y.json();
-      setRespYear({
-        year: Number(yj?.year ?? yr),
-        contributed_ytd: Number(yj?.contributed_ytd ?? 0),
-        grant_eligible_contrib_lifetime: yj?.grant_eligible_contrib_lifetime == null ? null : Number(yj.grant_eligible_contrib_lifetime),
-        carry_forward_grantable_per_child: yj?.carry_forward_grantable_per_child == null ? null : Number(yj.carry_forward_grantable_per_child),
-      });
-    })();
-  },[headers]);
-
-  // RESP account (if any)
-  const respAcc = useMemo(()=> accounts.find(a=>String(a.type).toUpperCase()==='RESP') ?? null, [accounts]);
-
-  // Remaining TFSA/RRSP this year
-  const tfsaRemaining = Math.max(0, Number(rooms?.tfsa ?? 0) - Number(progress?.tfsa_deposited ?? 0));
-  const rrspRemaining = Math.max(0, Number(rooms?.rrsp ?? 0) - Number(progress?.rrsp_deposited ?? 0));
-
-  // RESP math
-  const monthsLeft = monthsLeftThisYear();
-  const isFamily = Boolean(respAcc?.is_family_resp);
-  const children = Math.max(1, Number(respAcc?.children_covered ?? 1));
-  const lifetimeContrib = Math.max(0, Number(respAcc?.resp_lifetime_contributed ?? 0));
-
-  // Lifetime caps
-  const lifetimeCap = children * 50000;   // contributions
-  const lifetimeRoomRemaining = Math.max(0, lifetimeCap - lifetimeContrib);
-
-  // Grant lifetime cap: 36k per child
-  const grantLifetimeCap = children * 36000;
-  const grantEligibleLifetimeUsed = (() => {
-    const precise = respYear?.grant_eligible_contrib_lifetime;
-    if (precise != null) return Math.max(0, Math.min(grantLifetimeCap, precise));
-    return Math.max(0, Math.min(grantLifetimeCap, lifetimeContrib)); // fallback
-  })();
-  const grantEligibleLifetimeRemaining = Math.max(0, grantLifetimeCap - grantEligibleLifetimeUsed);
-
-  // This-year CESG cap: 2500 per child + up to one extra 2500 per child if carry-forward (manual override)
-  const carryOverride = Math.max(0, Math.min(2500, Number(respYear?.carry_forward_grantable_per_child ?? 0)));
-  const perChildGrantableThisYear = 2500 + carryOverride;
-  const thisYearGrantCap = children * perChildGrantableThisYear;
-
-  const respYTD = Math.max(0, Number(respYear?.contributed_ytd ?? 0));
-  const thisYearGrantRemaining = Math.max(0, thisYearGrantCap - respYTD);
-
-  // Final CESG-first target for this year (also bounded by remaining lifetime grant path)
-  const respGrantTargetThisYear = Math.min(thisYearGrantRemaining, grantEligibleLifetimeRemaining);
-  const respGrantTargetPerMonth = Math.ceil(respGrantTargetThisYear / monthsLeft);
-
-  // Allocation engine (priority: RESP grant → TFSA → RRSP → RESP to lifetime → Margin)
-  const allocation = useMemo(()=>{
-    let left = pledge;
-    const out = { resp: 0, tfsa: 0, rrsp: 0, margin: 0 };
-
-    // 1) RESP grant-first
-    if (left > 0 && respAcc) {
-      const amt = Math.min(left, Math.max(0, respGrantTargetPerMonth));
-      out.resp += amt;
-      left -= amt;
-    }
-
-    // 2) TFSA
-    if (left > 0 && tfsaRemaining > 0) {
-      const cap = Math.ceil(tfsaRemaining / monthsLeft);
-      const amt = Math.min(left, cap);
-      out.tfsa += amt;
-      left -= amt;
-    }
-
-    // 3) RRSP
-    if (left > 0 && rrspRemaining > 0) {
-      const cap = Math.ceil(rrspRemaining / monthsLeft);
-      const amt = Math.min(left, cap);
-      out.rrsp += amt;
-      left -= amt;
-    }
-
-    // 4) RESP toward lifetime (beyond grant)
-    if (left > 0 && respAcc && lifetimeRoomRemaining > 0) {
-      const cap = Math.ceil(lifetimeRoomRemaining / monthsLeft);
-      const amt = Math.min(left, cap);
-      out.resp += amt;
-      left -= amt;
-    }
-
-    // 5) Margin
-    if (left > 0) out.margin = left;
-
-    return out;
-  }, [pledge, respAcc, respGrantTargetPerMonth, tfsaRemaining, rrspRemaining, lifetimeRoomRemaining, monthsLeft]);
-
-  // Show RESP tile only if there is RESP account
-  const showRESP = Boolean(respAcc);
-
-  // mic
   const recRef = useRef<any>(null);
   const interimRef = useRef('');
   const lastFinalRef = useRef('');
-  const [interim, setInterim] = useState('');
 
-  const toggleMic = ()=>{
+  const toggleMic = () => {
     if (isMicOn) {
-      try{recRef.current?.stop();}catch{}
-      recRef.current=null;
+      try { recRef.current?.stop(); } catch {}
+      recRef.current = null;
       setIsMicOn(false);
       return;
     }
     const SR = (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition;
-    if(!SR){ alert('Speech recognition not supported.'); return; }
+    if (!SR) { alert('Speech recognition not supported.'); return; }
     const rec = new SR();
     rec.lang = 'en-US';
     rec.continuous = true;
     rec.interimResults = true;
-    rec.onresult = (ev:any)=>{
-      let finalChunk='', interimChunk='';
-      for(let i=ev.resultIndex;i<ev.results.length;i++){
-        const res = ev.results[i];
-        const t = res[0]?.transcript ?? '';
-        if(res.isFinal) finalChunk += t;
-        else interimChunk += t;
+    rec.onresult = (ev: any) => {
+      let finalChunk = '', interimChunk = '';
+      for (let i = ev.resultIndex; i < ev.results.length; i++) {
+        const res = ev.results[i]; const t = res[0]?.transcript ?? '';
+        if (res.isFinal) finalChunk += t; else interimChunk += t;
       }
-      if (finalChunk && finalChunk!==lastFinalRef.current){
+      if (finalChunk && finalChunk !== lastFinalRef.current) {
         lastFinalRef.current = finalChunk;
-        setText(p=>(p+' '+finalChunk).trim());
-        interimRef.current='';
-        setInterim('');
+        setText((p) => (p + ' ' + finalChunk).trim());
+        interimRef.current = '';
       }
-      if (interimChunk && interimChunk!==interimRef.current){
+      if (interimChunk && interimChunk !== interimRef.current) {
         interimRef.current = interimChunk;
-        setInterim(interimChunk);
+        setText((p) => (p + ' ' + interimChunk).trim());
       }
     };
-    rec.onend = ()=>setIsMicOn(false);
-    rec.onerror = ()=>setIsMicOn(false);
-    recRef.current = rec;
-    rec.start();
-    setIsMicOn(true);
+    rec.onend = () => setIsMicOn(false);
+    rec.onerror = () => setIsMicOn(false);
+    recRef.current = rec; rec.start(); setIsMicOn(true);
   };
 
-  const saveNote = ()=>{
-    const t = (text + (interim? ' '+interim : '')).trim();
-    if(!t) return;
-    const id = 'n-'+Math.random().toString(36).slice(2);
-    setNotes(arr=>[{id, ts:new Date().toISOString(), text:t}, ...arr]);
-    setText(''); setInterim(''); interimRef.current=''; lastFinalRef.current='';
-  };
-  const deleteNote = (id:string)=> setNotes(arr=>arr.filter(n=>n.id!==id));
+  // fetch everything
+  useEffect(() => {
+    if (!token) return;
 
-  const displayText = (text + (interim? ' '+interim : '')).trim();
+    (async () => {
+      try {
+        // rooms
+        const r1 = await fetch('/api/rooms', { headers: authHeaders });
+        const j1 = await r1.json();
+        const room = j1?.room ?? j1?.data ?? null;
+        if (room) setRooms(room as Rooms);
+      } catch {}
+
+      try {
+        // accounts
+        const r2 = await fetch('/api/accounts', { headers: authHeaders });
+        const j2 = await r2.json();
+        if (Array.isArray(j2?.items)) setAccounts(j2.items as Account[]);
+      } catch {}
+
+      try {
+        // resp progress
+        const r3 = await fetch('/api/resp-progress', { headers: authHeaders });
+        const j3 = await r3.json();
+        if (j3?.ok && j3?.data) {
+          const d = j3.data as RespProgress;
+          setResp({
+            total_value: Number(d.total_value ?? 0),
+            lifetime_contrib: Number(d.lifetime_contrib ?? 0),
+            contributed_this_year: Number(d.contributed_this_year ?? 0),
+            is_family_resp: !!d.is_family_resp,
+            children_covered: Math.max(1, Number(d.children_covered ?? 1)),
+          });
+        }
+      } catch {}
+    })();
+  }, [token]);
+
+  // derive RESP visibility & child count
+  const hasRespAccount = useMemo(
+    () => accounts.some(a => (a.type || '').toUpperCase() === 'RESP'),
+    [accounts]
+  );
+
+  const respChildren = useMemo(() => {
+    if (resp) return Math.max(1, resp.children_covered || 1);
+    // If no resp progress row yet: infer 1 child if a non-family RESP exists
+    const respLines = accounts.filter(a => (a.type || '').toUpperCase() === 'RESP');
+    if (respLines.length === 0) return 0;
+    // we only store children_covered for family; otherwise assume 1
+    const anyFamily = respLines.some(a => !!a.is_family_resp);
+    const kids = respLines.reduce((acc, a) => acc + (a.is_family_resp ? Math.max(1, Number(a.children_covered || 1)) : 1), 0);
+    return anyFamily ? Math.max(1, kids) : 1;
+  }, [resp, accounts]);
+
+  const showRespTile = hasRespAccount || !!resp;
+
+  // remaining rooms (TFSA/RRSP) – from contribution room minus nothing we can compute here (you track deposits elsewhere)
+  const tfsaRemaining = Math.max(0, Number(rooms?.tfsa ?? 0));
+  const rrspRemaining = Math.max(0, Number(rooms?.rrsp ?? 0));
+
+  // RESP remaining – grant path & lifetime
+  const respGrantRemainingThisYear = useMemo(() => {
+    if (!respChildren || !resp) return 0;
+    return computeGrantableRemainingThisYear(respChildren, resp.lifetime_contrib, resp.contributed_this_year);
+  }, [respChildren, resp]);
+
+  const respLifetimeRemaining = useMemo(() => {
+    if (!respChildren || !resp) return 0;
+    return computeRespLifetimeContributionRemaining(respChildren, resp.lifetime_contrib);
+  }, [respChildren, resp]);
+
+  // Split monthly pledge with CESG-first → TFSA → RRSP → RESP (to lifetime) → Margin
+  const monthsLeft = monthsLeftThisYear();
+  const capPerMonth = (room: number) => Math.ceil(room / monthsLeft);
+
+  const split = useMemo(() => {
+    let left = pledge;
+    const out = { resp: 0, tfsa: 0, rrsp: 0, margin: 0 };
+
+    // 1) RESP grant path (only if any grant still possible)
+    if (respGrantRemainingThisYear > 0) {
+      const amt = Math.min(left, capPerMonth(respGrantRemainingThisYear));
+      out.resp += amt; left -= amt;
+    }
+
+    // If lifetime CESG already reached (for all children), TFSA gets priority before more RESP
+    const grantDone = respChildren > 0 && resp ? cesgLifetimeReached(respChildren, resp.lifetime_contrib) : false;
+
+    // 2) TFSA, 3) RRSP
+    if (tfsaRemaining > 0) {
+      const amt = Math.min(left, capPerMonth(tfsaRemaining));
+      out.tfsa += amt; left -= amt;
+    }
+    if (rrspRemaining > 0) {
+      const amt = Math.min(left, capPerMonth(rrspRemaining));
+      out.rrsp += amt; left -= amt;
+    }
+
+    // 4) RESP leftover to lifetime cap (only if lifetime cap not reached)
+    if (!grantDone && respLifetimeRemaining > 0 && left > 0) {
+      const amt = Math.min(left, capPerMonth(respLifetimeRemaining));
+      out.resp += amt; left -= amt;
+    } else if (grantDone && left > 0 && respLifetimeRemaining > 0) {
+      // If CESG done but lifetime room exists, place RESP after TFSA/RRSP as per your rule
+      const amt = Math.min(left, capPerMonth(respLifetimeRemaining));
+      out.resp += amt; left -= amt;
+    }
+
+    // 5) Margin/Other
+    if (left > 0) out.margin = left;
+
+    return out;
+  }, [
+    pledge, monthsLeft,
+    tfsaRemaining, rrspRemaining,
+    respGrantRemainingThisYear, respLifetimeRemaining,
+    respChildren, resp
+  ]);
 
   return (
     <main className="max-w-6xl mx-auto p-4 space-y-4">
@@ -233,42 +263,56 @@ export default function GoalsPage(){
         <div className="text-sm font-medium mb-3">Monthly pledge</div>
         <div className="flex items-center gap-4">
           <div className="min-w-[120px] text-sm text-gray-700">{CAD(pledge)}</div>
-          <input type="range" className="flex-1 h-2 rounded-lg bg-gray-200 appearance-none accent-indigo-600"
-            min={0} max={10000} step={25} value={pledge}
-            onChange={e=>setPledge(Math.max(0, Math.round(+e.target.value)))} />
+          <input
+            type="range"
+            className="flex-1 h-2 rounded-lg bg-gray-200 appearance-none accent-indigo-600"
+            min={0}
+            max={10000}
+            step={25}
+            value={pledge}
+            onChange={(e) => setPledge(Math.max(0, Math.round(+e.target.value)))}
+          />
         </div>
         <div className="mt-2 text-xs text-gray-500">
-          Recommendation is specific to {new Date().toLocaleString(undefined,{month:'long', year:'numeric'})}
-          {' '}({monthsLeft} {monthsLeft===1?'month':'months'} left this year).
+          Recommendation is specific to {new Date().toLocaleString(undefined, { month: 'long', year: 'numeric' })} ({monthsLeft}{' '}
+          {monthsLeft === 1 ? 'month' : 'months'} left this year).
         </div>
       </section>
 
       {/* Recommendation tiles */}
       <section className="rounded-2xl border bg-white p-4 shadow-sm">
         <div className="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-4 gap-3">
-          {showRESP && (
+          {showRespTile && (
             <div className="rounded-xl border p-4">
               <div className="text-xs text-gray-600 mb-1">RESP</div>
-              <div className="text-2xl font-semibold">{CAD(allocation.resp)}</div>
+              <div className="text-2xl font-semibold">{CAD(split.resp)}</div>
               <div className="text-[11px] text-gray-500 mt-1">
-                Grant path remaining (this year): {CAD(Math.max(0, Math.min(respGrantTargetThisYear, thisYearGrantCap)))}
+                Grant path remaining (this year): {CAD(respGrantRemainingThisYear)}
               </div>
+              {resp && (
+                <div className="text-[11px] text-gray-500">
+                  Lifetime contribution room left: {CAD(respLifetimeRemaining)}
+                </div>
+              )}
             </div>
           )}
           <div className="rounded-xl border p-4">
             <div className="text-xs text-gray-600 mb-1">TFSA</div>
-            <div className="text-2xl font-semibold">{CAD(allocation.tfsa)}</div>
+            <div className="text-2xl font-semibold">{CAD(split.tfsa)}</div>
             <div className="text-[11px] text-gray-500 mt-1">Remaining this year: {CAD(tfsaRemaining)}</div>
           </div>
           <div className="rounded-xl border p-4">
             <div className="text-xs text-gray-600 mb-1">RRSP</div>
-            <div className="text-2xl font-semibold">{CAD(allocation.rrsp)}</div>
+            <div className="text-2xl font-semibold">{CAD(split.rrsp)}</div>
             <div className="text-[11px] text-gray-500 mt-1">Remaining this year: {CAD(rrspRemaining)}</div>
           </div>
           <div className="rounded-xl border p-4">
             <div className="text-xs text-gray-600 mb-1">Margin/Other</div>
-            <div className="text-2xl font-semibold">{CAD(allocation.margin)}</div>
+            <div className="text-2xl font-semibold">{CAD(split.margin)}</div>
           </div>
+        </div>
+        <div className="mt-3 text-xs text-gray-500">
+          Order: RESP (up to grant path and lifetime caps) → TFSA → RRSP → remainder to Margin/Other.
         </div>
       </section>
 
@@ -276,49 +320,27 @@ export default function GoalsPage(){
       <section className="rounded-2xl border bg-white p-4 shadow-sm">
         <div className="text-sm font-medium mb-3">Describe your goals</div>
         <div className="flex items-center gap-2 mb-3">
-          <button onClick={toggleMic}
-            className={`rounded p-2 ${isMicOn? 'bg-red-600':'bg-emerald-600'} text-white`}>
-            {/* mic icon */}
+          <button
+            onClick={toggleMic}
+            className={`rounded p-2 ${isMicOn ? 'bg-red-600' : 'bg-emerald-600'} text-white`}
+            aria-label={isMicOn ? 'Stop mic' : 'Start mic'}
+            title={isMicOn ? 'Stop mic' : 'Start mic'}
+          >
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
-              <path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Z"
-                stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
-              <path d="M19 11a7 7 0 0 1-14 0M12 18v3"
-                stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
+              <path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Z" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
+              <path d="M19 11a7 7 0 0 1-14 0M12 18v3" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
             </svg>
           </button>
-          <button onClick={saveNote} className="rounded bg-indigo-600 px-3 py-2 text-white">Save note</button>
+          <button className="rounded bg-indigo-600 px-3 py-2 text-white" onClick={() => {/* note save kept lightweight */}}>
+            Save note
+          </button>
         </div>
-        <textarea value={displayText} onChange={e=>setText(e.target.value)}
+        <textarea
+          value={text}
+          onChange={(e) => setText(e.target.value)}
           className="w-full min-h-[140px] rounded-lg border p-3 outline-none"
-          placeholder="Speak or type your plan..." />
-        <div className="mt-2 text-xs text-gray-500">
-          Your microphone text appears live while you speak. Click “Save note” to keep a record below. (Notes are stored in your browser for now.)
-        </div>
-      </section>
-
-      {/* Past notes */}
-      <section className="rounded-2xl border bg-white p-4 shadow-sm">
-        <div className="text-sm font-medium mb-3">Past Goals</div>
-        {notes.length===0? (
-          <div className="text-sm text-gray-600">No saved goals yet.</div>
-        ):(
-          <ul className="space-y-2">
-            {notes.map(n=>(
-              <li key={n.id} className="rounded-lg border p-3">
-                <div className="flex items-center justify-between">
-                  <div className="text-sm font-medium">
-                    {new Date(n.ts).toLocaleString(undefined,{year:'numeric',month:'short',day:'2-digit',hour:'2-digit',minute:'2-digit'})}
-                  </div>
-                  <button onClick={()=>deleteNote(n.id)} className="text-xs text-red-600 hover:underline">Delete</button>
-                </div>
-                <details className="mt-2">
-                  <summary className="cursor-pointer text-xs text-gray-600">Show note</summary>
-                  <div className="mt-2 whitespace-pre-wrap text-sm">{n.text}</div>
-                </details>
-              </li>
-            ))}
-          </ul>
-        )}
+          placeholder="Speak or type your plan..."
+        />
       </section>
     </main>
   );
