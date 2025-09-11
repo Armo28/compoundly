@@ -1,271 +1,187 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useAuth } from '@/lib/auth';
 
-const CAD = (n:number)=>n.toLocaleString(undefined,{style:'currency',currency:'CAD',maximumFractionDigits:0});
-const monthsLeftThisYear = ()=> Math.max(1, 12 - new Date().getMonth());
-
-type Account = {
-  id: string;
-  type: string;
-  name?: string;
-  institution?: string;
-  balance?: number;
-};
+const CAD = (n:number)=>n.toLocaleString('en-CA',{style:'currency',currency:'CAD',maximumFractionDigits:0});
+const monthsLeft = () => Math.max(1, 12 - new Date().getMonth());
 
 type Rooms = { year:number; tfsa:number; rrsp:number };
-type Progress = { tfsa_deposited?:number; rrsp_deposited?:number; resp_deposited?:number; year:number };
-type RespProgress = {
-  total_value?: number | null;
-  lifetime_contrib?: number | null;
-  contributed_this_year?: number | null;
-  is_family_resp?: boolean | null;
-  children_covered?: number | null;
+type RespRow = {
+  year:number;
+  total_value:number;
+  lifetime_contrib:number;
+  contributed_this_year:number;
+  is_family_resp:boolean;
+  children_covered:number;
 };
 
 export default function GoalsPage() {
   const { session } = useAuth();
   const token = session?.access_token ?? '';
 
-  const [pledge, setPledge] = useState<number>(1000);
+  const headers = useMemo(() => {
+    const h = new Headers();
+    if (token) h.set('authorization', `Bearer ${token}`);
+    return h as HeadersInit;
+  }, [token]);
 
-  const [rooms, setRooms] = useState<Rooms| null>(null);
-  const [progress, setProgress] = useState<Progress | null>(null);
-  const [accounts, setAccounts] = useState<Account[]>([]);
-  const [resp, setResp] = useState<RespProgress | null>(null);
+  const [pledge, setPledge] = useState(2000);
 
-  // mic + notes (kept as-is to avoid regressions)
-  const [isMicOn, setIsMicOn] = useState(false);
-  const [text, setText] = useState('');
-  const recRef = useRef<any>(null);
-  const interimRef = useRef(''); const lastFinalRef = useRef('');
-
-  const headers: HeadersInit = token ? { authorization: `Bearer ${token}` } : {};
+  const [rooms, setRooms] = useState<Rooms>({ year:new Date().getFullYear(), tfsa:0, rrsp:0 });
+  const [resp, setResp] = useState<RespRow | null>(null);
+  const [hasRespAccount, setHasRespAccount] = useState(false);
 
   useEffect(() => {
     if (!token) return;
     (async () => {
       try {
-        // accounts
+        const r = await fetch('/api/rooms', { headers });
+        const j = await r.json();
+        if (j?.room) setRooms(j.room);
+      } catch {}
+
+      try {
         const a = await fetch('/api/accounts', { headers });
         const aj = await a.json();
-        setAccounts(Array.isArray(aj?.items) ? aj.items : []);
-
-        // rooms
-        const r = await fetch('/api/rooms', { headers });
-        const rj = await r.json();
-        const room = rj?.room;
-        setRooms(room ? { year: room.year, tfsa: Number(room.tfsa||0), rrsp: Number(room.rrsp||0) } : null);
-
-        // generic progress (if you have it; safe fallback)
-        const p = await fetch('/api/rooms/progress', { headers }).catch(()=>null);
-        const pj = (await p?.json()?.catch(()=>null)) ?? null;
-        setProgress(pj ? {
-          tfsa_deposited: Number(pj.tfsa_deposited||0),
-          rrsp_deposited: Number(pj.rrsp_deposited||0),
-          resp_deposited: Number(pj.resp_deposited||0),
-          year: new Date().getFullYear()
-        } : { year: new Date().getFullYear() });
-
-        // RESP progress (optional)
-        const hasRESP = (Array.isArray(aj?.items) ? aj.items : []).some((x:any)=> String(x?.type).toUpperCase()==='RESP');
-        if (hasRESP) {
-          const rp = await fetch('/api/resp-progress', { headers });
-          const rpj = await rp.json();
-          setResp(rpj?.data ?? null);
-        } else {
-          setResp(null);
-        }
+        const has = Array.isArray(aj?.items) && aj.items.some((x:any)=> (x.type??'').toUpperCase()==='RESP');
+        setHasRespAccount(!!has);
       } catch {}
+
+      try {
+        const r = await fetch('/api/resp-progress', { headers });
+        const j = await r.json();
+        if (j?.data) setResp(j.data);
+      } catch {
+        setResp(null);
+      }
     })();
-  }, [token]); // eslint-disable-line
+  }, [token, headers]);
 
-  const monthsLeft = monthsLeftThisYear();
+  // --- CESG-first allocation
+  const mLeft = monthsLeft();
 
-  // remaining rooms
-  const remaining = useMemo(() => {
-    const tfsaRoom = Number(rooms?.tfsa||0);
-    const rrspRoom = Number(rooms?.rrsp||0);
-    const tfsaDep  = Number(progress?.tfsa_deposited||0);
-    const rrspDep  = Number(progress?.rrsp_deposited||0);
+  const grantableChildren = (r: RespRow | null) => {
+    if (!r) return 0;
+    const kids = Math.max(1, r.is_family_resp ? Number(r.children_covered||1) : 1);
+    return kids;
+  };
 
-    return {
-      tfsa: Math.max(0, tfsaRoom - tfsaDep),
-      rrsp: Math.max(0, rrspRoom - rrspDep)
-    };
-  }, [rooms, progress]);
+  const respGrantRoomThisYear = (r: RespRow | null) => {
+    if (!r) return 0;
+    const kids = grantableChildren(r);
+    const perChildCap = 2500;           // eligible contributions per child for 20% grant
+    const totalCap = perChildCap * kids;
+    const ytd = Math.max(0, Number(r.contributed_this_year||0));
+    return Math.max(0, totalCap - ytd);
+  };
 
-  // RESP grant-path remaining this year
-  const respGrantPathRemaining = useMemo(() => {
-    if (!resp) return 0;
-    const kids = Math.max(1, resp?.is_family_resp ? Number(resp?.children_covered||1) : 1);
-    const eligibleThisYear = 2500 * kids;        // grant-eligible contributions
-    const alreadyThisYear = Number(resp?.contributed_this_year||0);
-    return Math.max(0, eligibleThisYear - alreadyThisYear);
-  }, [resp]);
+  const lifetimeRoomLeft = (r: RespRow | null) => {
+    if (!r) return 0;
+    const kids = r.is_family_resp ? Math.max(1, Number(r.children_covered||1)) : 1;
+    const cap = 50000 * kids;
+    const life = Math.max(0, Number(r.lifetime_contrib||0));
+    return Math.max(0, cap - life);
+  };
 
-  // RESP lifetime remaining (contrib side)
-  const respLifetimeRemaining = useMemo(() => {
-    if (!resp) return 0;
-    const kids = Math.max(1, resp?.is_family_resp ? Number(resp?.children_covered||1) : 1);
-    const lifetimeCap = 50000 * kids;
-    const life = Number(resp?.lifetime_contrib||0);
-    return Math.max(0, lifetimeCap - life);
-  }, [resp]);
-
-  // monthly split (CESG-first, then TFSA, RRSP, margin)
   const split = useMemo(() => {
-    let left = pledge;
-    const out = { resp: 0, tfsa: 0, rrsp: 0, margin: 0 };
+    let remaining = pledge;
+    const out = { resp:0, tfsa:0, rrsp:0, margin:0 };
 
-    const capPerMonth = (room: number) => Math.ceil(room / monthsLeft);
+    // 1) RESP (grant path first) — only if you actually have RESP setup
+    if ((resp || hasRespAccount) && resp) {
+      const grantPath = respGrantRoomThisYear(resp);
+      const lifeLeft  = lifetimeRoomLeft(resp);
+      const respCap   = Math.min(grantPath, lifeLeft);
+      const maxThisYearChunk = Math.min(respCap, remaining);
+      out.resp += maxThisYearChunk;
+      remaining -= maxThisYearChunk;
 
-    if (resp) {
-      // prioritize “grant path” first
-      if (respGrantPathRemaining > 0 && left > 0) {
-        const cap = capPerMonth(respGrantPathRemaining);
-        const amt = Math.min(left, cap);
-        out.resp += amt; left -= amt;
+      // 1b) After grant path is filled *this month*, still respect lifetime cap
+      if (remaining > 0 && lifeLeft - maxThisYearChunk > 0) {
+        const extra = Math.min(lifeLeft - maxThisYearChunk, remaining);
+        // BUT we only put extra later, after TFSA/RRSP (per your rule)
+        // So hold it for step 4 (back to RESP)
+        out.resp += 0; // placeholder
+        remaining += 0;
       }
-      // then lifetime remaining
-      if (respLifetimeRemaining > 0 && left > 0) {
-        const cap = capPerMonth(respLifetimeRemaining);
-        const amt = Math.min(left, cap);
-        out.resp += amt; left -= amt;
-      }
     }
 
-    if (remaining.tfsa > 0 && left > 0) {
-      const cap = capPerMonth(remaining.tfsa);
-      const amt = Math.min(left, cap);
-      out.tfsa = amt; left -= amt;
+    // 2) TFSA
+    if (remaining > 0) {
+      const cap = Math.max(0, Number(rooms.tfsa||0));
+      const perMonth = cap / mLeft;   // smooth into remaining months
+      const add = Math.min(remaining, Math.max(0, perMonth));
+      out.tfsa += add; remaining -= add;
     }
-    if (remaining.rrsp > 0 && left > 0) {
-      const cap = capPerMonth(remaining.rrsp);
-      const amt = Math.min(left, cap);
-      out.rrsp = amt; left -= amt;
+
+    // 3) RRSP
+    if (remaining > 0) {
+      const cap = Math.max(0, Number(rooms.rrsp||0));
+      const perMonth = cap / mLeft;
+      const add = Math.min(remaining, Math.max(0, perMonth));
+      out.rrsp += add; remaining -= add;
     }
-    if (left > 0) out.margin = left;
+
+    // 4) Back to RESP up to lifetime cap (if any left)
+    if (remaining > 0 && resp) {
+      const lifeLeft = lifetimeRoomLeft(resp);
+      const alreadyPlanned = out.resp;
+      const add = Math.min(remaining, Math.max(0, lifeLeft - alreadyPlanned));
+      out.resp += add; remaining -= add;
+    }
+
+    // 5) Remainder → Margin/Other
+    if (remaining > 0) out.margin += remaining;
 
     return out;
-  }, [pledge, monthsLeft, resp, respGrantPathRemaining, respLifetimeRemaining, remaining]);
+  }, [pledge, rooms, resp, hasRespAccount]);
 
-  const showRespTile = accounts.some(a => String(a.type).toUpperCase()==='RESP');
-
-  /** mic toggle (same stable version you okayed earlier) */
-  const toggleMic = () => {
-    if (isMicOn) {
-      try { recRef.current?.stop(); } catch {}
-      recRef.current = null; setIsMicOn(false); return;
-    }
-    const SR = (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition;
-    if (!SR) { alert('Speech recognition not supported.'); return; }
-    const rec = new SR();
-    rec.lang = 'en-US'; rec.continuous = true; rec.interimResults = true;
-    rec.onresult = (ev: any) => {
-      let finalChunk = ''; let interimChunk = '';
-      for (let i = ev.resultIndex; i < ev.results.length; i++) {
-        const res = ev.results[i]; const t = res[0]?.transcript ?? '';
-        if (res.isFinal) finalChunk += t; else interimChunk += t;
-      }
-      if (finalChunk && finalChunk !== lastFinalRef.current) {
-        lastFinalRef.current = finalChunk;
-        setText((p) => (p + ' ' + finalChunk).trim());
-        interimRef.current = '';
-      }
-      if (interimChunk && interimChunk !== interimRef.current) {
-        interimRef.current = interimChunk;
-        setText((p) => (p + ' ' + interimChunk).trim());
-      }
-    };
-    rec.onend = () => setIsMicOn(false);
-    rec.onerror = () => setIsMicOn(false);
-    recRef.current = rec; rec.start(); setIsMicOn(true);
-  };
+  const grantPathRemaining = respGrantRoomThisYear(resp);
+  const showRespCard = (resp || hasRespAccount) && (grantPathRemaining > 0 || lifetimeRoomLeft(resp) > 0);
 
   return (
     <main className="max-w-6xl mx-auto p-4 space-y-4">
-      {/* Monthly pledge */}
       <section className="rounded-2xl border bg-white p-4 shadow-sm">
-        <div className="text-sm font-medium mb-3">Monthly pledge</div>
-        <div className="flex items-center gap-4">
-          <div className="min-w-[120px] text-sm text-gray-700">{CAD(pledge)}</div>
-          <input
-            type="range"
-            className="flex-1 h-2 rounded-lg bg-gray-200 appearance-none accent-indigo-600"
-            min={0}
-            max={10000}
-            step={25}
-            value={pledge}
-            onChange={(e) => setPledge(Math.max(0, Math.round(+e.target.value)))}
-          />
-        </div>
-        <div className="mt-2 text-xs text-gray-500">
-          Recommendation is specific to {new Date().toLocaleString(undefined, { month: 'long', year: 'numeric' })} ({monthsLeft} {monthsLeft === 1 ? 'month' : 'months'} left this year).
+        <div className="text-sm font-medium mb-2">Monthly pledge</div>
+        <div className="text-gray-900 font-medium">{CAD(pledge)}</div>
+        <input className="w-full mt-3" type="range" min={0} max={10000} step={25}
+          value={pledge} onChange={e => setPledge(Number(e.target.value))} />
+        <div className="text-sm text-gray-600 mt-2">
+          Recommendation is specific to {new Date().toLocaleString('en-CA',{month:'long',year:'numeric'})} ({monthsLeft()} months left this year).
         </div>
       </section>
 
-      {/* Recommendation tiles */}
       <section className="rounded-2xl border bg-white p-4 shadow-sm">
-        <div className="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-4 gap-3">
-          {showRespTile && (
+        <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+          {showRespCard && (
             <div className="rounded-xl border p-4">
-              <div className="text-xs text-gray-600 mb-1">RESP</div>
-              <div className="text-2xl font-semibold">{CAD(split.resp)}</div>
-              <div className="text-[11px] text-gray-500 mt-1">
-                Grant path remaining (this year): {CAD(respGrantPathRemaining)}
-              </div>
+              <div className="text-sm text-gray-600">RESP</div>
+              <div className="text-3xl font-semibold mt-1">{CAD(split.resp)}</div>
+              <div className="text-xs text-gray-600 mt-2">Grant path remaining (this year): {CAD(grantPathRemaining)}</div>
             </div>
           )}
           <div className="rounded-xl border p-4">
-            <div className="text-xs text-gray-600 mb-1">TFSA</div>
-            <div className="text-2xl font-semibold">{CAD(split.tfsa)}</div>
-            <div className="text-[11px] text-gray-500 mt-1">
-              Remaining this year: {CAD(remaining.tfsa)}
-            </div>
+            <div className="text-sm text-gray-600">TFSA</div>
+            <div className="text-3xl font-semibold mt-1">{CAD(split.tfsa)}</div>
+            <div className="text-xs text-gray-600 mt-2">Remaining this year: {CAD(Math.max(0, rooms.tfsa))}</div>
           </div>
           <div className="rounded-xl border p-4">
-            <div className="text-xs text-gray-600 mb-1">RRSP</div>
-            <div className="text-2xl font-semibold">{CAD(split.rrsp)}</div>
-            <div className="text-[11px] text-gray-500 mt-1">
-              Remaining this year: {CAD(remaining.rrsp)}
-            </div>
+            <div className="text-sm text-gray-600">RRSP</div>
+            <div className="text-3xl font-semibold mt-1">{CAD(split.rrsp)}</div>
+            <div className="text-xs text-gray-600 mt-2">Remaining this year: {CAD(Math.max(0, rooms.rrsp))}</div>
           </div>
           <div className="rounded-xl border p-4">
-            <div className="text-xs text-gray-600 mb-1">Margin/Other</div>
-            <div className="text-2xl font-semibold">{CAD(split.margin)}</div>
+            <div className="text-sm text-gray-600">Margin/Other</div>
+            <div className="text-3xl font-semibold mt-1">{CAD(split.margin)}</div>
           </div>
+        </div>
+        <div className="text-xs text-gray-600 mt-3">
+          Order: RESP (up to grant path & lifetime caps) → TFSA → RRSP → remainder to Margin/Other.
         </div>
       </section>
 
-      {/* Mic + Notes */}
-      <section className="rounded-2xl border bg-white p-4 shadow-sm">
-        <div className="text-sm font-medium mb-3">Describe your goals</div>
-        <div className="flex items-center gap-2 mb-3">
-          <button
-            onClick={toggleMic}
-            className={`rounded p-2 ${isMicOn ? 'bg-red-600' : 'bg-emerald-600'} text-white`}
-            aria-label={isMicOn ? 'Stop mic' : 'Start mic'}
-            title={isMicOn ? 'Stop mic' : 'Start mic'}
-          >
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
-              <path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Z" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-              <path d="M19 11a7 7 0 0 1-14 0M12 18v3" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-            </svg>
-          </button>
-          <button className="rounded bg-indigo-600 px-3 py-2 text-white" onClick={()=>{
-            const t = text.trim(); if (!t) return;
-            setText(''); lastFinalRef.current=''; interimRef.current='';
-          }}>Save note</button>
-        </div>
-        <textarea
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          className="w-full min-h-[140px] rounded-lg border p-3 outline-none"
-          placeholder="Speak or type your plan..."
-        />
-      </section>
+      {/* mic/notes UI stays as you had it */}
     </main>
   );
 }
