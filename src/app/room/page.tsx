@@ -2,46 +2,68 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { useAuth } from '@/lib/auth';
+import {
+  PieChart, Pie, Cell, ResponsiveContainer, Tooltip
+} from 'recharts';
 
-type Rooms = { year: number; tfsa: number; rrsp: number };
+type Rooms = { year: number; tfsa: number; rrsp: number; tfsa_ytd?: number; rrsp_ytd?: number };
 type RespProgress = {
   total_value?: number | null;
   lifetime_contrib?: number | null;
   contributed_this_year?: number | null;
   is_family_resp?: boolean | null;
   children_covered?: number | null;
+  carry_forward_grantable_per_child?: number | null;
   catchup_years_per_child?: number | null;
 };
 
-// ---- simple donut (SVG) ----
-function Donut({ pct, label, sub }: { pct: number; label: string; sub?: string }) {
-  const clamped = Math.max(0, Math.min(100, pct));
-  const R = 58, STROKE = 12, C = 70, CIRC = 2 * Math.PI * R;
-  const offset = CIRC * (1 - clamped / 100);
+const CAD = (n: number) =>
+  (n || 0).toLocaleString(undefined, { style: 'currency', currency: 'CAD', maximumFractionDigits: 0 });
+
+function makeHeaders(token: string | undefined, asJson = false): HeadersInit {
+  const h = new Headers();
+  if (token) h.set('authorization', `Bearer ${token}`);
+  if (asJson) h.set('content-type', 'application/json');
+  return h as HeadersInit;
+}
+
+const donutColors = ['#4f46e5', '#e5e7eb'];
+
+function Donut({ title, used, total, subtitle }: { title: string; used: number; total: number; subtitle?: string }) {
+  const safeTotal = Math.max(total || 0, 1);
+  const data = [
+    { name: 'used', value: Math.min(Math.max(used, 0), safeTotal) },
+    { name: 'left', value: Math.max(safeTotal - Math.max(used, 0), 0) },
+  ];
+  const pct = Math.round((data[0].value / safeTotal) * 100);
+
   return (
     <div className="flex flex-col items-center">
-      <svg width="160" height="160" viewBox="0 0 140 140">
-        <circle cx={C} cy={C} r={R} stroke="#e5e7eb" strokeWidth={STROKE} fill="none"/>
-        <circle
-          cx={C} cy={C} r={R}
-          strokeWidth={STROKE}
-          strokeLinecap="round"
-          stroke="url(#g)"
-          fill="none"
-          strokeDasharray={CIRC}
-          strokeDashoffset={offset}
-          transform="rotate(-90 70 70)"
-        />
-        <defs>
-          <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0%" stopColor="#4f46e5" />
-            <stop offset="100%" stopColor="#a855f7" />
-          </linearGradient>
-        </defs>
-        <text x="70" y="68" fontSize="20" textAnchor="middle" fontWeight="600">{Math.round(clamped)}%</text>
-        <text x="70" y="88" fontSize="10" textAnchor="middle" fill="#6b7280">{label}</text>
-      </svg>
-      {sub && <div className="text-xs text-gray-500 mt-1">{sub}</div>}
+      <div className="text-sm mb-2">{title}</div>
+      <div style={{ width: 164, height: 164 }}>
+        <ResponsiveContainer>
+          <PieChart>
+            <Pie
+              data={data}
+              dataKey="value"
+              innerRadius={56}
+              outerRadius={76}
+              startAngle={90}
+              endAngle={-270}
+              paddingAngle={0}
+            >
+              {data.map((_, i) => <Cell key={i} fill={donutColors[i]} />)}
+            </Pie>
+            <Tooltip
+              formatter={(v: any, n: any) => [CAD(Number(v)), n]}
+            />
+          </PieChart>
+        </ResponsiveContainer>
+      </div>
+      <div className="text-sm text-gray-700">{pct}%</div>
+      <div className="text-xs text-gray-500">
+        {subtitle ?? `${CAD(used)}/${CAD(total)}`}
+      </div>
     </div>
   );
 }
@@ -50,86 +72,91 @@ export default function RoomPage() {
   const { session } = useAuth();
   const token = session?.access_token ?? '';
 
-  // headers that never include undefined
-  const authHeaders: HeadersInit = useMemo(() => (
-    token ? { authorization: `Bearer ${token}` } : {}
-  ), [token]);
+  // ---------- headers ----------
+  const authHeaders = useMemo(() => makeHeaders(token), [token]);
+  const jsonHeaders = useMemo(() => makeHeaders(token, true), [token]);
 
-  const jsonHeaders: HeadersInit = useMemo(() => (
-    token
-      ? { authorization: `Bearer ${token}`, 'content-type': 'application/json' }
-      : { 'content-type': 'application/json' }
-  ), [token]);
+  // ---------- TFSA / RRSP (string-backed) ----------
+  const [tfsaStr, setTfsaStr] = useState('');
+  const [rrspStr, setRrspStr] = useState('');
+  const [tfsaYtdStr, setTfsaYtdStr] = useState('');
+  const [rrspYtdStr, setRrspYtdStr] = useState('');
+  const [roomsSaved, setRoomsSaved] = useState({ tfsaStr: '', rrspStr: '', tfsaYtdStr: '', rrspYtdStr: '' });
+  const [roomsSaving, setRoomsSaving] = useState(false);
+
+  // ---------- RESP (string-backed) ----------
+  const [respAvail, setRespAvail] = useState(true);
+  const [respStr, setRespStr] = useState({ total: '', life: '', year: '', kids: '', carry: '', catchup: '' });
+  const [respFamily, setRespFamily] = useState(false);
+  const [respSaved, setRespSaved] = useState({ total: '', life: '', year: '', kids: '', carry: '', catchup: '', family: false });
+  const [respSaving, setRespSaving] = useState(false);
 
   const toNum = (s: string) => {
     const n = Number((s ?? '').replace(/,/g, '').trim());
     return Number.isFinite(n) ? n : 0;
-  };
+    };
   const asStr = (n: number | null | undefined) => (n == null ? '' : String(n));
 
-  // ---------- TFSA/RRSP ----------
-  const [tfsaStr, setTfsaStr] = useState('');
-  const [rrspStr, setRrspStr] = useState('');
-  const [roomsSaved, setRoomsSaved] = useState({ tfsaStr: '', rrspStr: '' });
-  const [roomsSaving, setRoomsSaving] = useState(false);
+  const dirtyRooms =
+    tfsaStr !== roomsSaved.tfsaStr ||
+    rrspStr !== roomsSaved.rrspStr ||
+    tfsaYtdStr !== roomsSaved.tfsaYtdStr ||
+    rrspYtdStr !== roomsSaved.rrspYtdStr;
 
-  // For donut context, assume (this-year allowance) is roomsSaved + used
-  // If you track “cap” elsewhere, plug it in here:
-  const TFSA_THIS_YEAR_CAP = 7500; // adjust if you store real cap per user/year
-  const RRSP_THIS_YEAR_CAP = 18000;
+  const dirtyResp =
+    respAvail &&
+    (respStr.total !== respSaved.total ||
+      respStr.life !== respSaved.life ||
+      respStr.year !== respSaved.year ||
+      respStr.carry !== respSaved.carry ||
+      respStr.catchup !== respSaved.catchup ||
+      respFamily !== respSaved.family ||
+      (respFamily && respStr.kids !== respSaved.kids));
 
-  const tfsaRemaining = toNum(tfsaStr || '0');
-  const rrspRemaining = toNum(rrspStr || '0');
-  const tfsaUsed = Math.max(0, TFSA_THIS_YEAR_CAP - tfsaRemaining);
-  const rrspUsed = Math.max(0, RRSP_THIS_YEAR_CAP - rrspRemaining);
-
-  const tfsaPct = TFSA_THIS_YEAR_CAP ? (tfsaUsed / TFSA_THIS_YEAR_CAP) * 100 : 0;
-  const rrspPct = RRSP_THIS_YEAR_CAP ? (rrspUsed / RRSP_THIS_YEAR_CAP) * 100 : 0;
-
-  // ---------- RESP ----------
-  const [respAvail, setRespAvail] = useState(true);
-  const [respStr, setRespStr] = useState({ total:'', life:'', year:'', kids:'', catchup:'' });
-  const [respFamily, setRespFamily] = useState(false);
-  const [respSaved, setRespSaved] = useState({ total:'', life:'', year:'', kids:'', catchup:'', family:false });
-  const [respSaving, setRespSaving] = useState(false);
-
-  // Load once
+  // ---------- initial fetch ----------
   useEffect(() => {
     let mounted = true;
     (async () => {
       if (!token) return;
 
+      // rooms
       try {
         const r = await fetch('/api/rooms', { headers: authHeaders });
         const j = await r.json();
-        const room = j?.room as Rooms | undefined;
+        const room: Rooms | undefined = j?.room;
         if (room && mounted) {
           const tfsa = asStr(room.tfsa);
           const rrsp = asStr(room.rrsp);
+          const tfsaY = asStr(room.tfsa_ytd ?? 0);
+          const rrspY = asStr(room.rrsp_ytd ?? 0);
           setTfsaStr(tfsa);
           setRrspStr(rrsp);
-          setRoomsSaved({ tfsaStr: tfsa, rrspStr: rrsp });
+          setTfsaYtdStr(tfsaY);
+          setRrspYtdStr(rrspY);
+          setRoomsSaved({ tfsaStr: tfsa, rrspStr: rrsp, tfsaYtdStr: tfsaY, rrspYtdStr: rrspY });
         }
-      } catch {}
+      } catch { /* ignore */ }
 
+      // resp
       try {
         const r = await fetch('/api/resp-progress', { headers: authHeaders });
-        if (!r.ok) throw new Error();
+        if (!r.ok) throw new Error('no resp api');
         const j = await r.json();
         const d: RespProgress | null = j?.data ?? null;
         if (!mounted) return;
 
         setRespAvail(true);
-        const total   = asStr(d?.total_value);
-        const life    = asStr(d?.lifetime_contrib);
-        const year    = asStr(d?.contributed_this_year);
-        const fam     = !!d?.is_family_resp;
-        const kids    = asStr(d?.children_covered);
-        const catchup = asStr(d?.catchup_years_per_child);
+        const total  = asStr(d?.total_value);
+        const life   = asStr(d?.lifetime_contrib);
+        const year   = asStr(d?.contributed_this_year);
+        const fam    = !!d?.is_family_resp;
+        const kids   = asStr(d?.children_covered);
+        const carry  = asStr(d?.carry_forward_grantable_per_child ?? 0);
+        const catchp = asStr(d?.catchup_years_per_child ?? 0);
 
-        setRespStr({ total, life, year, kids, catchup });
+        setRespStr({ total, life, year, kids, carry, catchup: catchp });
         setRespFamily(fam);
-        setRespSaved({ total, life, year, kids, catchup, family: fam });
+        setRespSaved({ total, life, year, kids, carry, catchup: catchp, family: fam });
       } catch {
         if (!mounted) return;
         setRespAvail(false);
@@ -138,35 +165,32 @@ export default function RoomPage() {
     return () => { mounted = false; };
   }, [token, authHeaders]);
 
-  const dirtyRooms = tfsaStr !== roomsSaved.tfsaStr || rrspStr !== roomsSaved.rrspStr;
+  // ---------- save handlers ----------
   const saveRooms = async () => {
     if (!dirtyRooms || roomsSaving) return;
     setRoomsSaving(true);
     try {
-      const payload = { tfsa: toNum(tfsaStr), rrsp: toNum(rrspStr) };
-      const r = await fetch('/api/rooms', {
-        method: 'POST',
-        headers: jsonHeaders,
-        body: JSON.stringify(payload),
-      });
+      const payload = {
+        tfsa: toNum(tfsaStr),
+        rrsp: toNum(rrspStr),
+        tfsa_ytd: toNum(tfsaYtdStr),
+        rrsp_ytd: toNum(rrspYtdStr),
+      };
+      const r = await fetch('/api/rooms', { method: 'POST', headers: jsonHeaders, body: JSON.stringify(payload) });
       const j = await r.json();
       if (!j?.ok) throw new Error(j?.error ?? 'Save failed');
-      setRoomsSaved({ tfsaStr: String(payload.tfsa), rrspStr: String(payload.rrsp) });
-    } catch (e:any) {
+      setRoomsSaved({
+        tfsaStr: String(payload.tfsa),
+        rrspStr: String(payload.rrsp),
+        tfsaYtdStr: String(payload.tfsa_ytd),
+        rrspYtdStr: String(payload.rrsp_ytd),
+      });
+    } catch (e: any) {
       alert(e?.message || 'Save failed');
     } finally {
       setRoomsSaving(false);
     }
   };
-
-  const dirtyResp =
-    respAvail &&
-    (respStr.total !== respSaved.total ||
-     respStr.life  !== respSaved.life  ||
-     respStr.year  !== respSaved.year  ||
-     respFamily    !== respSaved.family ||
-     respStr.catchup !== respSaved.catchup ||
-     (respFamily && respStr.kids !== respSaved.kids));
 
   const saveResp = async () => {
     if (!respAvail || respSaving || !dirtyResp) return;
@@ -178,13 +202,10 @@ export default function RoomPage() {
         contributed_this_year: toNum(respStr.year),
         is_family_resp: !!respFamily,
         children_covered: respFamily ? Math.max(1, Number(respStr.kids || '1')) : 1,
+        carry_forward_grantable_per_child: toNum(respStr.carry),
         catchup_years_per_child: Math.max(0, Number(respStr.catchup || '0')),
       };
-      const r = await fetch('/api/resp-progress', {
-        method: 'POST',
-        headers: jsonHeaders,
-        body: JSON.stringify(payload),
-      });
+      const r = await fetch('/api/resp-progress', { method: 'POST', headers: jsonHeaders, body: JSON.stringify(payload) });
       const j = await r.json();
       if (!j?.ok) throw new Error(j?.error ?? 'Save failed');
 
@@ -193,45 +214,52 @@ export default function RoomPage() {
         life:  String(payload.lifetime_contrib),
         year:  String(payload.contributed_this_year),
         kids:  payload.children_covered != null ? String(payload.children_covered) : '',
-        catchup: String(payload.catchup_years_per_child ?? '0'),
+        carry: String(payload.carry_forward_grantable_per_child ?? 0),
+        catchup: String(payload.catchup_years_per_child ?? 0),
         family: !!payload.is_family_resp,
       };
       setRespSaved(saved);
-    } catch (e:any) {
+    } catch (e: any) {
       alert(e?.message || 'Save failed');
     } finally {
       setRespSaving(false);
     }
   };
 
+  // ---------- computed for donuts ----------
+  const tfsaRoom = toNum(tfsaStr);
+  const rrspRoom = toNum(rrspStr);
+  const tfsaYTD  = toNum(tfsaYtdStr);
+  const rrspYTD  = toNum(rrspYtdStr);
+
+  // For TFSA/RRSP donuts we show “contributed this year vs remaining room”.
+  const tfsaTotalGrantable = tfsaRoom + tfsaYTD;
+  const rrspTotalGrantable = rrspRoom + rrspYTD;
+
+  const kids = Math.max(1, Number(respFamily ? (respStr.kids || '1') : '1'));
+  const respLifeCap = kids * 50000;
+  const respLifeUsed = toNum(respStr.life);
+  const perChildGrantableThisYear = 2500 + toNum(respStr.carry);
+  const respGrantableThisYearTotal = kids * perChildGrantableThisYear;
+  const respContribYear = toNum(respStr.year);
+
   if (!session) {
     return (
       <main className="max-w-6xl mx-auto p-4">
-        <div className="rounded-xl border bg-white p-6">Sign in to edit room &amp; RESP progress.</div>
+        <div className="rounded-xl border bg-white p-6">Sign in to edit room & RESP progress.</div>
       </main>
     );
   }
 
-  // ---- RESP donut math ----
-  const kidsCount = respFamily ? Math.max(1, Number(respStr.kids || '1')) : 1;
-  const lifetimeCap = 50000 * kidsCount;
-  const lifeUsed = Math.max(0, toNum(respStr.life || '0'));
-  const lifePct = lifetimeCap ? (lifeUsed / lifetimeCap) * 100 : 0;
-
-  const baseGrantPerChild = 2500;
-  const catchupPerChild = Math.max(0, Number(respStr.catchup || '0')) * 2500;
-  const grantCapThisYear = (baseGrantPerChild + catchupPerChild) * kidsCount; // grantable contrib path
-  const yearContrib = toNum(respStr.year || '0');
-  const grantPct = grantCapThisYear ? Math.min(100, (yearContrib / grantCapThisYear) * 100) : 0;
-
   return (
     <main className="max-w-6xl mx-auto p-4 space-y-4">
-      {/* TFSA/RRSP Room */}
+
+      {/* TFSA & RRSP Room + YTD */}
       <section className="rounded-2xl border bg-white p-4 shadow-sm">
         <div className="text-sm font-medium mb-3">TFSA &amp; RRSP Room (this year)</div>
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 items-end">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
           <div className="flex flex-col">
-            <label className="text-xs text-gray-600">TFSA room</label>
+            <label className="text-xs text-gray-600">TFSA room (remaining)</label>
             <input
               className="rounded-md border px-3 py-2"
               type="text"
@@ -240,9 +268,19 @@ export default function RoomPage() {
               value={tfsaStr}
               onChange={e => setTfsaStr(e.target.value)}
             />
+            <label className="text-xs text-gray-600 mt-3">TFSA contributed YTD</label>
+            <input
+              className="rounded-md border px-3 py-2"
+              type="text"
+              inputMode="decimal"
+              placeholder="e.g., 1000"
+              value={tfsaYtdStr}
+              onChange={e => setTfsaYtdStr(e.target.value)}
+            />
           </div>
+
           <div className="flex flex-col">
-            <label className="text-xs text-gray-600">RRSP room</label>
+            <label className="text-xs text-gray-600">RRSP room (remaining)</label>
             <input
               className="rounded-md border px-3 py-2"
               type="text"
@@ -251,7 +289,17 @@ export default function RoomPage() {
               value={rrspStr}
               onChange={e => setRrspStr(e.target.value)}
             />
+            <label className="text-xs text-gray-600 mt-3">RRSP contributed YTD</label>
+            <input
+              className="rounded-md border px-3 py-2"
+              type="text"
+              inputMode="decimal"
+              placeholder="e.g., 3000"
+              value={rrspYtdStr}
+              onChange={e => setRrspYtdStr(e.target.value)}
+            />
           </div>
+
           <div className="flex items-end">
             <button
               onClick={saveRooms}
@@ -270,14 +318,16 @@ export default function RoomPage() {
         {/* TFSA/RRSP donuts */}
         <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-6">
           <Donut
-            pct={tfsaPct}
-            label="TFSA used"
-            sub={`${tfsaUsed.toLocaleString('en-CA',{style:'currency',currency:'CAD',maximumFractionDigits:0})} of ${TFSA_THIS_YEAR_CAP.toLocaleString('en-CA',{style:'currency',currency:'CAD',maximumFractionDigits:0})}`}
+            title="TFSA YTD vs room"
+            used={tfsaYTD}
+            total={tfsaTotalGrantable}
+            subtitle={`${CAD(tfsaYTD)} used / ${CAD(tfsaRoom)} left`}
           />
           <Donut
-            pct={rrspPct}
-            label="RRSP used"
-            sub={`${rrspUsed.toLocaleString('en-CA',{style:'currency',currency:'CAD',maximumFractionDigits:0})} of ${RRSP_THIS_YEAR_CAP.toLocaleString('en-CA',{style:'currency',currency:'CAD',maximumFractionDigits:0})}`}
+            title="RRSP YTD vs room"
+            used={rrspYTD}
+            total={rrspTotalGrantable}
+            subtitle={`${CAD(rrspYTD)} used / ${CAD(rrspRoom)} left`}
           />
         </div>
       </section>
@@ -286,8 +336,7 @@ export default function RoomPage() {
       {respAvail && (
         <section className="rounded-2xl border bg-white p-4 shadow-sm">
           <div className="text-sm font-medium mb-3">RESP Progress</div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-5 gap-3 items-end">
+          <div className="grid grid-cols-1 lg:grid-cols-5 gap-4 items-end">
             <div className="flex flex-col">
               <label className="text-xs text-gray-600">Total current value</label>
               <input
@@ -344,20 +393,45 @@ export default function RoomPage() {
                 />
               </div>
             )}
+          </div>
 
-            <div className="sm:col-span-5 grid grid-cols-1 sm:grid-cols-3 gap-6 mt-3">
-              <div className="flex flex-col">
-                <label className="text-xs text-gray-600">Catch-up years per child</label>
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mt-5">
+            <Donut
+              title="Lifetime cap"
+              used={respLifeUsed}
+              total={respLifeCap}
+              subtitle={`${CAD(respLifeUsed)}/${CAD(respLifeCap)}`}
+            />
+            <Donut
+              title="Grant path this year"
+              used={respContribYear}
+              total={respGrantableThisYearTotal}
+              subtitle={`${CAD(respContribYear)}/${CAD(respGrantableThisYearTotal)}`}
+            />
+            <div className="flex flex-col gap-3 justify-center">
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-gray-600 w-40">Carry-forward grantable / child</span>
                 <input
-                  className="rounded-md border px-3 py-2"
+                  className="rounded-md border px-3 py-2 w-40"
+                  type="text"
+                  inputMode="decimal"
+                  placeholder="e.g., 2500"
+                  value={respStr.carry}
+                  onChange={e => setRespStr(s => ({ ...s, carry: e.target.value }))}
+                />
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-gray-600 w-40">Catch-up years / child</span>
+                <input
+                  className="rounded-md border px-3 py-2 w-40"
                   type="text"
                   inputMode="numeric"
-                  placeholder="e.g., 2"
+                  placeholder="e.g., 1"
                   value={respStr.catchup}
                   onChange={e => setRespStr(s => ({ ...s, catchup: e.target.value }))}
                 />
               </div>
-              <div className="flex items-end">
+              <div className="flex justify-end">
                 <button
                   onClick={saveResp}
                   disabled={!dirtyResp || respSaving}
@@ -370,19 +444,6 @@ export default function RoomPage() {
                   {respSaving ? 'Saving…' : 'Save'}
                 </button>
               </div>
-            </div>
-
-            <div className="sm:col-span-5 grid grid-cols-1 sm:grid-cols-2 gap-6 mt-4">
-              <Donut
-                pct={lifePct}
-                label="Lifetime cap"
-                sub={`${lifeUsed.toLocaleString('en-CA',{style:'currency',currency:'CAD',maximumFractionDigits:0})}/${lifetimeCap.toLocaleString('en-CA',{style:'currency',currency:'CAD',maximumFractionDigits:0})}`}
-              />
-              <Donut
-                pct={grantPct}
-                label="Grant path this year"
-                sub={`${yearContrib.toLocaleString('en-CA',{style:'currency',currency:'CAD',maximumFractionDigits:0})}/${grantCapThisYear.toLocaleString('en-CA',{style:'currency',currency:'CAD',maximumFractionDigits:0})}`}
-              />
             </div>
           </div>
         </section>
