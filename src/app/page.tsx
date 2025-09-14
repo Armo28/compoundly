@@ -125,7 +125,7 @@ export default function DashboardPage() {
       d.setMonth(i);
       balance = balance * (1 + monthlyRate) + monthly;
       const ts = d.getTime();
-      const actual = ts <= nowTs ? balance : null;
+      const actual = ts <= nowTs ? balance : null;  // <= now only
       pts.push({ ts, actual, proj: balance });
     }
     return pts;
@@ -312,11 +312,11 @@ export default function DashboardPage() {
 
           {/* Prevent SVG focus/click outlines */}
           <div
-            className="h-[320px] outline-none"
+            className="h-[320px] outline-none no-outline"
             onMouseDown={(e) => e.preventDefault()}
           >
             <ResponsiveContainer width="100%" height="100%">
-              <PieChart focusable={false} style={{ outline: 'none' }}>
+              <PieChart style={{ outline: 'none' }}>
                 <Pie
                   data={pieData}
                   dataKey="value"
@@ -325,7 +325,6 @@ export default function DashboardPage() {
                   outerRadius={120}
                   stroke="none"
                   isAnimationActive={false}
-                  focusable={false}
                 >
                   {pieData.map((s) => (
                     <Cell key={s.key} fill={s.color} />
@@ -354,6 +353,11 @@ export default function DashboardPage() {
               </PieChart>
             </ResponsiveContainer>
           </div>
+
+          {/* scoped style to suppress outlines if SVG gets focus */}
+          <style jsx>{`
+            .no-outline :global(svg:focus) { outline: none; }
+          `}</style>
 
           {/* Legend */}
           <div className="mt-2 flex items-center justify-center gap-5 text-sm">
