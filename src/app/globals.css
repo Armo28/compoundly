@@ -1,16 +1,9 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
-
-body { @apply bg-white text-gray-900; }
-button { @apply rounded px-3 py-2; }
-
-/* Kill any SVG/legend focus outline from Recharts */
-.recharts-wrapper:focus,
-.recharts-surface:focus,
-.recharts-wrapper:focus-visible,
-.recharts-surface:focus-visible,
+/* Kill focus outlines on donut slices and legend */
 .recharts-legend-wrapper:focus,
-.recharts-legend-wrapper:focus-visible {
+.recharts-legend-wrapper:focus-visible,
+.recharts-sector:focus,
+.recharts-sector:focus-visible,
+.no-focus *:focus,
+.no-focus *:focus-visible {
   outline: none !important;
 }
