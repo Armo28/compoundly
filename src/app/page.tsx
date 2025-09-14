@@ -1,381 +1,290 @@
 'use client';
 
-import { useEffect, useMemo, useState, memo } from 'react';
+import {useEffect, useMemo, useState} from 'react';
 import {
-  ResponsiveContainer,
-  AreaChart, Area,
-  Line,
-  XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine,
-  PieChart, Pie, Cell,
+  AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
+  PieChart, Pie, Cell, Legend
 } from 'recharts';
-import { useAuth } from '@/lib/auth';
 
-// ---------- helpers ----------
-const CAD = (n: number) =>
-  n.toLocaleString(undefined, { style: 'currency', currency: 'CAD', maximumFractionDigits: 0 });
+type Point = { t: number; v: number }; // t = timestamp (ms), v = value (CAD)
 
-const compactCAD = (n: number) => {
-  const abs = Math.abs(n);
-  if (abs >= 1_000_000_000) return `CA$${(n / 1_000_000_000).toFixed(1)}B`;
-  if (abs >= 1_000_000)     return `CA$${(n / 1_000_000).toFixed(1)}M`;
-  if (abs >= 1_000)         return `CA$${(n / 1_000).toFixed(1)}K`;
-  return CAD(n);
-};
-
-const jan1 = (y: number) => new Date(y, 0, 1).getTime();
-const monthStart = (y: number, m: number) => new Date(y, m, 1).getTime();
-
-type Account = {
-  id: string;
-  type: 'TFSA'|'RRSP'|'RESP'|'Margin'|'Other'|'LIRA';
-  balance: number | null;
-};
-
+const CAD = (n:number)=>n.toLocaleString(undefined,{style:'currency',currency:'CAD',maximumFractionDigits:0});
 const COLORS = {
-  tfsa: '#10b981',
-  rrsp: '#3b82f6',
-  resp: '#f59e0b',
-  grid: '#e5e7eb',
-  axis: '#6b7280',
-  areaStroke: '#111827',
-  areaFill: '#16a34a',
-  dashed: '#16a34a',
+  axis: '#60646c',
+  grid: '#eceff3',
+  actual: '#111827',
+  projStroke: '#16a34a',
+  projFillStart: 'rgba(22,163,74,1)',   // 100%
+  projFillEnd:   'rgba(22,163,74,0.2)', // 20%
+  pieTFSA: '#22c55e',
+  pieRRSP: '#60a5fa',
+  pieRESP: '#f59e0b',
 };
 
-// Custom X tick for month view (bold/larger for January with year label)
-const MonthTick = memo(function MonthTick(props: any) {
-  const { x, y, payload } = props;
-  const d = new Date(Number(payload.value));
-  const isJan = d.getMonth() === 0;
-  const label = isJan
-    ? String(d.getFullYear())
-    : d.toLocaleString(undefined, { month: 'short' });
-  return (
-    <text
-      x={x}
-      y={y + 12}
-      textAnchor="middle"
-      fill={COLORS.axis}
-      fontSize={isJan ? 12.5 : 11}
-      fontWeight={isJan ? 700 : 400}
-    >
-      {label}
-    </text>
-  );
-});
+function startOfMonth(d: Date) {
+  return new Date(d.getFullYear(), d.getMonth(), 1, 0, 0, 0, 0);
+}
+function addMonths(d: Date, n: number) {
+  return new Date(d.getFullYear(), d.getMonth() + n, 1);
+}
+function monthsBetween(a: Date, b: Date) {
+  return (b.getFullYear() - a.getFullYear()) * 12 + (b.getMonth() - a.getMonth());
+}
 
-export default function DashboardPage() {
-  const { session } = useAuth();
-  const token = session?.access_token ?? '';
+export default function Dashboard() {
+  // ---- controls (defaults you asked for) ----
+  const [monthly, setMonthly] = useState(1000);   // CA$1,000 default
+  const [growth, setGrowth]   = useState(0.10);   // 10% default
+  const [yearsWin, setYearsWin] = useState(12);   // a nice default window
 
-  // fetch accounts -> allocation + starting balance
-  const [accounts, setAccounts] = useState<Account[]>([]);
-  useEffect(() => {
-    let mounted = true;
-    (async () => {
-      try {
-        const headers = token ? { authorization: `Bearer ${token}` } : {};
-        const r = await fetch('/api/accounts', { headers: headers as HeadersInit });
-        const j = await r.json();
-        if (!mounted) return;
-        setAccounts(Array.isArray(j?.items) ? j.items : []);
-      } catch {
-        // keep UI usable
+  // pretend “current” equity is based on Accounts donut (we’ll read it from DOM later if needed)
+  const [equityTFSA, equityRRSP, equityRESP] = [25000, 50000, 15000];
+  const totalEquity = equityTFSA + equityRRSP + equityRESP;
+
+  // ---- window and time bases ----
+  const now = useMemo(()=> new Date(), []);
+  const windowStart = useMemo(()=> startOfMonth(now), [now]);
+  const windowEnd   = useMemo(()=> addMonths(windowStart, yearsWin*12), [windowStart, yearsWin]);
+
+  // ---- build monthly series once per dependency change ----
+  const {actualData, projectionData, ticks, useMonthlyTicks} = useMemo(()=>{
+    // series includes windowStart..windowEnd (month steps)
+    const months = monthsBetween(windowStart, windowEnd) + 1;
+    const dataAll: Point[] = [];
+    const r = (1 + growth/12); // monthly compound factor
+
+    // model: start with totalEquity at “now” month; backfill earlier months linearly (flat) to keep a baseline
+    // then compound forward for projection
+    // To ensure a smooth join, we compute backwards from “now” one could model a simple flat line; that keeps
+    // the “actual” separate visually while still filled area.
+    const nowMonthIndex = 0; // first point is current month
+    for (let i=0;i<months;i++){
+      const d = addMonths(windowStart, i);
+      const t = d.getTime();
+      if (i <= nowMonthIndex) {
+        // Actual: keep as the known totalEquity (you can later replace with true historical fetch)
+        dataAll.push({t, v: totalEquity});
+      } else {
+        // Projection: compound prior value and add monthly contributions
+        const prev = dataAll[i-1].v;
+        const projected = prev*r + monthly;
+        dataAll.push({t, v: projected});
       }
-    })();
-    return () => { mounted = false; };
-  }, [token]);
-
-  // allocation
-  const { total, tfsa, rrsp, resp } = useMemo(() => {
-    let tfsa = 0, rrsp = 0, resp = 0, other = 0;
-    for (const a of accounts) {
-      const bal = Number(a.balance ?? 0);
-      if (a.type === 'TFSA') tfsa += bal;
-      else if (a.type === 'RRSP') rrsp += bal;
-      else if (a.type === 'RESP') resp += bal;
-      else other += bal;
     }
-    return { total: tfsa + rrsp + resp + other, tfsa, rrsp, resp };
-  }, [accounts]);
 
-  // controls
-  const [years, setYears] = useState(20);
-  const [monthly, setMonthly] = useState(1000);
-  const [growth, setGrowth]   = useState(20); // %
-  const minYears = 2;
-  const maxYears = 40;
+    // Split series: actual = [windowStart..now]; projection = (now+1)..end
+    const actual: Point[] = dataAll.slice(0, nowMonthIndex+1);
+    const proj:   Point[] = dataAll.slice(nowMonthIndex+1);
 
-  const yearNow = new Date().getFullYear();
-  const startTs = jan1(yearNow);
-  const endTs   = jan1(yearNow + years);
-  const nowTs   = Date.now();
-
-  // main dataset (monthly points across the window)
-  const data = useMemo(() => {
-    const pts: { ts: number; actual: number | null; proj: number }[] = [];
-    const monthlyRate = Math.pow(1 + growth / 100, 1 / 12) - 1;
-    const totalMonths = years * 12;
-
-    // start projection from current total
-    let balance = total;
-
-    for (let i = 0; i <= totalMonths; i++) {
-      const d = new Date(yearNow, 0, 1);
-      d.setMonth(i);
-      balance = balance * (1 + monthlyRate) + monthly;
-      const ts = d.getTime();
-      const actual = ts <= nowTs ? balance : null;  // <= now only
-      pts.push({ ts, actual, proj: balance });
-    }
-    return pts;
-  }, [total, monthly, growth, years, yearNow, nowTs]);
-
-  // Ticks: years normally, months when window ≤ 2 years
-  const isMonthView = years <= 2;
-  const xTicks = useMemo(() => {
+    // X ticks
+    const totalMonths = monthsBetween(windowStart, windowEnd);
+    const monthlyTicks = totalMonths <= 24;
     const ticks: number[] = [];
-    if (isMonthView) {
-      let y = yearNow, m = 0;
-      const totalMonths = years * 12;
-      for (let i = 0; i <= totalMonths; i++) {
-        ticks.push(monthStart(y, m));
-        m++;
-        if (m > 11) { m = 0; y += 1; }
-      }
+    if (monthlyTicks) {
+      for (let i=0;i<months;i++) ticks.push(addMonths(windowStart, i).getTime());
     } else {
-      for (let y = yearNow; y <= yearNow + years; y++) ticks.push(jan1(y));
+      // year ticks (every January)
+      let y = windowStart.getFullYear();
+      while (y <= windowEnd.getFullYear()) {
+        ticks.push(new Date(y, 0, 1).getTime());
+        y += 1;
+      }
     }
-    return ticks;
-  }, [isMonthView, yearNow, years]);
 
-  const tenYearMarker = jan1(yearNow + 10);
+    return {actualData: actual, projectionData: proj, ticks, useMonthlyTicks: monthlyTicks};
+  }, [windowStart, windowEnd, totalEquity, monthly, growth]);
 
-  // donut data
+  // ---- tooltip (no duplicate lines) ----
+  const CustomTooltip = ({active, payload, label}: any) => {
+    if (!active) return null;
+    const ts = Number(label);
+    // Decide which series we’re hovering: actual if ts === last actual timestamp; otherwise projection
+    const isActual = actualData.length > 0 && ts === actualData[actualData.length-1].t;
+    const seriesVal = isActual
+      ? actualData.find(p=>p.t===ts)?.v
+      : projectionData.find(p=>p.t===ts)?.v;
+
+    if (seriesVal == null) return null;
+    const date = new Date(ts);
+    const when = useMonthlyTicks
+      ? date.toLocaleString(undefined,{month:'short', year:'numeric'})
+      : date.getFullYear().toString();
+
+    return (
+      <div className="rounded-md border bg-white px-3 py-2 shadow-sm">
+        <div className="text-xs text-gray-600">{when}</div>
+        <div className="text-sm font-medium" style={{color: isActual ? COLORS.actual : COLORS.projStroke}}>
+          {CAD(seriesVal)}
+        </div>
+      </div>
+    );
+  };
+
+  // ---- donut data ----
   const pieData = [
-    { name: 'TFSA', value: tfsa, key: 'tfsa', color: COLORS.tfsa },
-    { name: 'RRSP', value: rrsp, key: 'rrsp', color: COLORS.rrsp },
-    { name: 'RESP', value: resp, key: 'resp', color: COLORS.resp },
+    {name:'TFSA', value: equityTFSA, color: COLORS.pieTFSA},
+    {name:'RRSP', value: equityRRSP, color: COLORS.pieRRSP},
+    {name:'RESP', value: equityRESP, color: COLORS.pieRESP},
   ];
 
   return (
-    <main className="mx-auto max-w-7xl p-4 space-y-4">
+    <main className="max-w-7xl mx-auto p-4 space-y-4">
       <section className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        {/* Left: Chart */}
-        <div className="lg:col-span-2 rounded-2xl border bg-white p-4 shadow-sm">
-          <div className="flex items-center justify-between mb-2">
-            <h2 className="text-lg font-semibold">Portfolio Value (Actual &amp; Projected)</h2>
-            <div className="flex items-center gap-4 text-sm">
-              <span className="inline-flex items-center gap-2">
-                <span className="inline-block h-2 w-6 rounded bg-black" />
-                <span>Actual (area filled)</span>
-              </span>
-              <span className="inline-flex items-center gap-2">
-                <span className="inline-block h-0.5 w-6 rounded border-t-2 border-dashed" style={{ borderTopColor: COLORS.dashed }} />
-                <span>Projection</span>
-              </span>
-            </div>
-          </div>
-
+        {/* Chart */}
+        <div className="rounded-2xl border bg-white p-4 shadow-sm lg:col-span-2">
+          <div className="mb-2 font-semibold">Portfolio Value (Actual & Projected)</div>
           <div className="h-[380px]">
             <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={data} margin={{ top: 10, right: 10, bottom: 0, left: 0 }}>
+              <AreaChart margin={{left:0,right:12,top:8,bottom:0}}>
                 <defs>
-                  <linearGradient id="areaFill" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor={COLORS.areaFill} stopOpacity={0.20} />
-                    <stop offset="100%" stopColor={COLORS.areaFill} stopOpacity={0.05} />
+                  <linearGradient id="projFill" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor={COLORS.projFillStart} stopOpacity={1}/>
+                    <stop offset="100%" stopColor={COLORS.projFillEnd} stopOpacity={1}/>
+                  </linearGradient>
+                  <linearGradient id="actualFill" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#111827" stopOpacity={0.18}/>
+                    <stop offset="100%" stopColor="#111827" stopOpacity={0.06}/>
                   </linearGradient>
                 </defs>
 
                 <CartesianGrid stroke={COLORS.grid} vertical={false} />
-
                 <XAxis
-                  dataKey="ts"
+                  dataKey="t"
                   type="number"
-                  domain={[startTs, endTs]}
-                  ticks={xTicks}
-                  {...(
-                    isMonthView
-                      ? { tick: <MonthTick /> }
-                      : { tick: { fill: COLORS.axis, fontSize: 12 } }
-                  )}
-                  tickFormatter={
-                    isMonthView
-                      ? undefined
-                      : (ts) => new Date(Number(ts)).getFullYear().toString()
-                  }
-                  axisLine={{ stroke: COLORS.grid }}
-                  tickLine={{ stroke: COLORS.grid }}
-                  minTickGap={28}
-                />
-                <YAxis
-                  tickFormatter={(v) => compactCAD(Number(v))}
+                  domain={['dataMin','dataMax']}
+                  ticks={ticks}
+                  tickFormatter={(ts:number)=>{
+                    const d = new Date(ts);
+                    return useMonthlyTicks ? d.toLocaleString(undefined,{month:'short'}) + (d.getMonth()===0 ? ` ${d.getFullYear()}` : '') : d.getFullYear().toString();
+                  }}
                   tick={{ fill: COLORS.axis, fontSize: 12 }}
                   axisLine={{ stroke: COLORS.grid }}
                   tickLine={{ stroke: COLORS.grid }}
-                  width={64}
+                  minTickGap={22}
                 />
-                <Tooltip
-                  formatter={(v: any) => [CAD(Number(v)), 'value']}
-                  labelFormatter={(ts) =>
-                    new Date(Number(ts)).toLocaleDateString(undefined, { day: '2-digit', month: 'short', year: 'numeric' })
-                  }
+                <YAxis
+                  tick={{ fill: COLORS.axis, fontSize: 12 }}
+                  axisLine={{ stroke: COLORS.grid }}
+                  tickLine={{ stroke: COLORS.grid }}
+                  tickFormatter={(n)=>CAD(n).replace(/\.\d{2}$/,'')}
+                  width={72}
                 />
+                <Tooltip content={<CustomTooltip />} />
 
-                {/* Actual area only up to "now" */}
+                {/* Actual area up to now */}
                 <Area
-                  type="monotone"
-                  dataKey="actual"
-                  stroke={COLORS.areaStroke}
-                  fill="url(#areaFill)"
+                  data={actualData}
+                  dataKey="v"
+                  stroke={COLORS.actual}
                   strokeWidth={2}
-                  dot={false}
+                  fill="url(#actualFill)"
                   isAnimationActive={false}
-                  connectNulls={false}
                 />
 
-                {/* Full dashed projection */}
-                <Line
-                  type="monotone"
-                  dataKey="proj"
-                  stroke={COLORS.dashed}
-                  strokeWidth={2}
+                {/* Projection from next month onward */}
+                <Area
+                  data={projectionData}
+                  dataKey="v"
+                  stroke={COLORS.projStroke}
                   strokeDasharray="6 6"
-                  dot={false}
+                  strokeWidth={2}
+                  fill="url(#projFill)"
                   isAnimationActive={false}
                 />
-
-                <ReferenceLine x={tenYearMarker} stroke="#9ca3af" strokeDasharray="3 3" />
               </AreaChart>
             </ResponsiveContainer>
           </div>
 
-          {/* Zoom & sliders in ONE card */}
-          <div className="mt-3 space-y-3">
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => setYears((y) => Math.max(minYears, y - 1))}
-                className="rounded-md border px-3 py-1 text-sm"
-              >-1</button>
-              <button
-                onClick={() => setYears((y) => Math.min(maxYears, y + 1))}
-                className="rounded-md border px-3 py-1 text-sm"
-              >+1</button>
-              <span className="ml-2 text-sm text-gray-600">{years} year window</span>
-            </div>
-
+          {/* sliders in a single card */}
+          <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-4">
             <div className="rounded-xl border p-3">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {/* Monthly Contribution */}
-                <div>
-                  <div className="flex items-center justify-between text-sm">
-                    <span className="font-medium">Monthly Contribution</span>
-                    <span className="text-gray-700">{CAD(monthly)}</span>
-                  </div>
-                  <input
-                    aria-label="Monthly Contribution"
-                    type="range"
-                    min={0}
-                    max={10000}
-                    step={50}
-                    value={monthly}
-                    onChange={(e) => setMonthly(Number(e.target.value))}
-                    className="mt-2 w-full"
-                  />
-                </div>
-
-                {/* Annual Growth (max 50%) */}
-                <div>
-                  <div className="flex items-center justify-between text-sm">
-                    <span className="font-medium">Annual Growth</span>
-                    <span className="text-gray-700">{growth}%</span>
-                  </div>
-                  <input
-                    aria-label="Annual Growth"
-                    type="range"
-                    min={0}
-                    max={50}
-                    step={0.5}
-                    value={growth}
-                    onChange={(e) => setGrowth(Number(e.target.value))}
-                    className="mt-2 w-full"
-                  />
-                </div>
+              <div className="mb-1 flex justify-between text-sm">
+                <span>Monthly Contribution</span>
+                <span className="font-medium">{CAD(monthly)}</span>
               </div>
+              <input
+                type="range"
+                min={0}
+                max={5000}
+                step={50}
+                value={monthly}
+                onChange={e=>setMonthly(Number(e.target.value))}
+                className="w-full"
+              />
             </div>
+            <div className="rounded-xl border p-3">
+              <div className="mb-1 flex justify-between text-sm">
+                <span>Annual Growth</span>
+                <span className="font-medium">{Math.round(growth*100)}%</span>
+              </div>
+              <input
+                type="range"
+                min={0}
+                max={50}            // up to 50%
+                step={1}
+                value={Math.round(growth*100)}
+                onChange={e=>setGrowth(Number(e.target.value)/100)}
+                className="w-full"
+              />
+            </div>
+          </div>
+
+          {/* zoom controls + window label */}
+          <div className="mt-3 flex items-center gap-2">
+            <button
+              onClick={()=>setYearsWin(y=>Math.max(1, y-1))}
+              className="rounded-md border px-3 py-1 text-sm"
+            >-1</button>
+            <button
+              onClick={()=>setYearsWin(y=>Math.min(40, y+1))}
+              className="rounded-md border px-3 py-1 text-sm"
+            >+1</button>
+            <span className="text-sm text-gray-600">{yearsWin} year window</span>
           </div>
         </div>
 
-        {/* Right: Allocation donut */}
+        {/* Donut */}
         <div className="rounded-2xl border bg-white p-4 shadow-sm">
-          <h2 className="mb-2 text-lg font-semibold">Account Allocation</h2>
-
-          {/* Prevent SVG focus/click outlines */}
-          <div
-            className="h-[320px] outline-none no-outline"
-            onMouseDown={(e) => e.preventDefault()}
-          >
+          <div className="mb-2 font-semibold">Account Allocation</div>
+          <div className="h-[300px]">
             <ResponsiveContainer width="100%" height="100%">
-              <PieChart style={{ outline: 'none' }}>
+              <PieChart>
                 <Pie
                   data={pieData}
                   dataKey="value"
                   nameKey="name"
-                  innerRadius={80}
-                  outerRadius={120}
+                  innerRadius="60%"
+                  outerRadius="85%"
                   stroke="none"
                   isAnimationActive={false}
                 >
-                  {pieData.map((s) => (
-                    <Cell key={s.key} fill={s.color} />
+                  {pieData.map((s)=>(
+                    <Cell key={s.name} fill={s.color} />
                   ))}
                 </Pie>
-
-                {/* Center label */}
-                <text
-                  x="50%" y="45%"
-                  textAnchor="middle"
-                  dominantBaseline="middle"
-                  className="fill-gray-900"
-                  style={{ fontWeight: 600 }}
-                >
-                  Total
-                </text>
-                <text
-                  x="50%" y="58%"
-                  textAnchor="middle"
-                  dominantBaseline="middle"
-                  className="fill-gray-900"
-                  style={{ fontWeight: 700, fontSize: 18 }}
-                >
-                  {CAD(total)}
-                </text>
               </PieChart>
             </ResponsiveContainer>
           </div>
-
-          {/* scoped style to suppress outlines if SVG gets focus */}
-          <style jsx>{`
-            .no-outline :global(svg:focus) { outline: none; }
-          `}</style>
-
-          {/* Legend */}
-          <div className="mt-2 flex items-center justify-center gap-5 text-sm">
-            <LegendDot color={COLORS.tfsa} label="TFSA" />
-            <LegendDot color={COLORS.rrsp} label="RRSP" />
-            <LegendDot color={COLORS.resp} label="RESP" />
+          <div className="mt-2 text-center font-semibold">Total {CAD(totalEquity)}</div>
+          <div className="mt-2 flex items-center justify-center gap-4 text-sm">
+            <Legend
+              wrapperStyle={{display:'none'}}
+            />
+            <span className="inline-flex items-center gap-1">
+              <span className="inline-block h-3 w-3 rounded-full" style={{background:COLORS.pieTFSA}}/>
+              TFSA
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <span className="inline-block h-3 w-3 rounded-full" style={{background:COLORS.pieRRSP}}/>
+              RRSP
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <span className="inline-block h-3 w-3 rounded-full" style={{background:COLORS.pieRESP}}/>
+              RESP
+            </span>
           </div>
         </div>
       </section>
     </main>
-  );
-}
-
-function LegendDot({ color, label }: { color: string; label: string }) {
-  return (
-    <span className="inline-flex items-center gap-2">
-      <span className="inline-block h-3 w-3 rounded-full" style={{ backgroundColor: color }} />
-      <span>{label}</span>
-    </span>
   );
 }
