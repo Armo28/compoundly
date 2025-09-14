@@ -1,10 +1,10 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, memo } from 'react';
 import {
   ResponsiveContainer,
   AreaChart, Area,
-  LineChart, Line,
+  Line,
   XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine,
   PieChart, Pie, Cell,
 } from 'recharts';
@@ -22,23 +22,48 @@ const compactCAD = (n: number) => {
   return CAD(n);
 };
 
-const startOfYear = (y: number) => new Date(y, 0, 1).getTime();
 const jan1 = (y: number) => new Date(y, 0, 1).getTime();
+const monthStart = (y: number, m: number) => new Date(y, m, 1).getTime();
 
-type Account = { id: string; type: 'TFSA'|'RRSP'|'RESP'|'Margin'|'Other'|'LIRA'; balance: number | null };
-
-// Palette (match your app)
-const COLORS = {
-  tfsa: '#10b981',   // green
-  rrsp: '#3b82f6',   // blue
-  resp: '#f59e0b',   // yellow
-  grid: '#e5e7eb',   // light gray
-  axis: '#6b7280',   // gray-500
-  area: '#16a34a',   // green-600
-  dashed: '#16a34a', // same hue for projection
+type Account = {
+  id: string;
+  type: 'TFSA'|'RRSP'|'RESP'|'Margin'|'Other'|'LIRA';
+  balance: number | null;
 };
 
-// ---------- page ----------
+const COLORS = {
+  tfsa: '#10b981',  // green
+  rrsp: '#3b82f6',  // blue
+  resp: '#f59e0b',  // yellow
+  grid: '#e5e7eb',
+  axis: '#6b7280',
+  areaStroke: '#111827', // black for "Actual" line stroke (legend chip)
+  areaFill: '#16a34a',   // green fill
+  dashed: '#16a34a',     // green dashed for projection
+};
+
+// Custom X tick for month view (bold/larger for January with year label)
+const MonthTick = memo(function MonthTick(props: any) {
+  const { x, y, payload } = props;
+  const d = new Date(Number(payload.value));
+  const isJan = d.getMonth() === 0;
+  const label = isJan
+    ? String(d.getFullYear())
+    : d.toLocaleString(undefined, { month: 'short' });
+  return (
+    <text
+      x={x}
+      y={y + 12}
+      textAnchor="middle"
+      fill={COLORS.axis}
+      fontSize={isJan ? 12.5 : 11}
+      fontWeight={isJan ? 700 : 400}
+    >
+      {label}
+    </text>
+  );
+});
+
 export default function DashboardPage() {
   const { session } = useAuth();
   const token = session?.access_token ?? '';
@@ -53,10 +78,9 @@ export default function DashboardPage() {
         const r = await fetch('/api/accounts', { headers: headers as HeadersInit });
         const j = await r.json();
         if (!mounted) return;
-        const list: Account[] = Array.isArray(j?.items) ? j.items : [];
-        setAccounts(list);
+        setAccounts(Array.isArray(j?.items) ? j.items : []);
       } catch {
-        // leave empty; show zeros gracefully
+        // fall back to zeros; UI stays usable
       }
     })();
     return () => { mounted = false; };
@@ -75,38 +99,56 @@ export default function DashboardPage() {
     return { total: tfsa + rrsp + resp + other, tfsa, rrsp, resp };
   }, [accounts]);
 
-  // controls (defaults to your screenshot)
-  const [years, setYears] = useState(12);     // 12 years visible
+  // controls (keep your defaults; growth up to 50%)
+  const [years, setYears] = useState(20);
   const [monthly, setMonthly] = useState(1000);
-  const [growth, setGrowth]   = useState(10); // %
+  const [growth, setGrowth]   = useState(20); // %
+  const minYears = 2; // requirement
+  const maxYears = 40;
 
   const yearNow = new Date().getFullYear();
-  const startTs = jan1(yearNow);               // x-axis starts Jan 1 this year
+  const startTs = jan1(yearNow);
   const endTs   = jan1(yearNow + years);
+  const nowTs   = Date.now();
 
-  // projection model: monthly compounding with monthly contributions
+  // main dataset (monthly points across the window)
   const data = useMemo(() => {
-    const points: { ts: number; value: number; proj: number }[] = [];
+    const pts: { ts: number; actual: number | null; proj: number }[] = [];
     const monthlyRate = Math.pow(1 + growth / 100, 1 / 12) - 1;
-    const months = years * 12;
+    const totalMonths = years * 12;
 
-    let balance = total; // start from aggregated current equity
-    for (let i = 0; i <= months; i++) {
+    // start projection from current total
+    let balance = total;
+
+    for (let i = 0; i <= totalMonths; i++) {
       const d = new Date(yearNow, 0, 1);
-      d.setMonth(0 + i); // month i from Jan
-      // project forward from current total
+      d.setMonth(i); // month i from Jan this year
       balance = balance * (1 + monthlyRate) + monthly;
-      points.push({ ts: d.getTime(), value: balance, proj: balance });
+      const ts = d.getTime();
+      // "actual" only until now -> visually separates the series
+      const actual = ts <= nowTs ? balance : null;
+      pts.push({ ts, actual, proj: balance });
     }
-    return points;
-  }, [total, monthly, growth, years, yearNow]);
+    return pts;
+  }, [total, monthly, growth, years, yearNow, nowTs]);
 
-  // year ticks (avoid overlap)
-  const yearTicks = useMemo(() => {
+  // Ticks: years normally, months when window ≤ 2 years
+  const isMonthView = years <= 2;
+  const xTicks = useMemo(() => {
     const ticks: number[] = [];
-    for (let y = yearNow; y <= yearNow + years; y++) ticks.push(jan1(y));
+    if (isMonthView) {
+      let y = yearNow, m = 0;
+      const totalMonths = years * 12;
+      for (let i = 0; i <= totalMonths; i++) {
+        ticks.push(monthStart(y, m));
+        m++;
+        if (m > 11) { m = 0; y += 1; }
+      }
+    } else {
+      for (let y = yearNow; y <= yearNow + years; y++) ticks.push(jan1(y));
+    }
     return ticks;
-  }, [yearNow, years]);
+  }, [isMonthView, yearNow, years]);
 
   const tenYearMarker = jan1(yearNow + 10);
 
@@ -120,7 +162,7 @@ export default function DashboardPage() {
   return (
     <main className="mx-auto max-w-7xl p-4 space-y-4">
       <section className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        {/* Left: Chart card */}
+        {/* Left: Chart */}
         <div className="lg:col-span-2 rounded-2xl border bg-white p-4 shadow-sm">
           <div className="flex items-center justify-between mb-2">
             <h2 className="text-lg font-semibold">Portfolio Value (Actual &amp; Projected)</h2>
@@ -141,8 +183,8 @@ export default function DashboardPage() {
               <AreaChart data={data} margin={{ top: 10, right: 10, bottom: 0, left: 0 }}>
                 <defs>
                   <linearGradient id="areaFill" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor={COLORS.area} stopOpacity={0.20} />
-                    <stop offset="100%" stopColor={COLORS.area} stopOpacity={0.05} />
+                    <stop offset="0%" stopColor={COLORS.areaFill} stopOpacity={0.20} />
+                    <stop offset="100%" stopColor={COLORS.areaFill} stopOpacity={0.05} />
                   </linearGradient>
                 </defs>
 
@@ -152,8 +194,13 @@ export default function DashboardPage() {
                   dataKey="ts"
                   type="number"
                   domain={[startTs, endTs]}
-                  ticks={yearTicks}
-                  tickFormatter={(ts) => new Date(Number(ts)).getFullYear().toString()}
+                  ticks={xTicks}
+                  tick={isMonthView ? <MonthTick /> : undefined}
+                  tickFormatter={
+                    isMonthView
+                      ? undefined
+                      : (ts) => new Date(Number(ts)).getFullYear().toString()
+                  }
                   tick={{ fill: COLORS.axis, fontSize: 12 }}
                   axisLine={{ stroke: COLORS.grid }}
                   tickLine={{ stroke: COLORS.grid }}
@@ -167,24 +214,25 @@ export default function DashboardPage() {
                   width={64}
                 />
                 <Tooltip
-                  formatter={(v: any, _n, p) => [CAD(Number(v)), 'value']}
+                  formatter={(v: any) => [CAD(Number(v)), 'value']}
                   labelFormatter={(ts) =>
                     new Date(Number(ts)).toLocaleDateString(undefined, { day: '2-digit', month: 'short', year: 'numeric' })
                   }
                 />
 
-                {/* Filled "Actual" area (we render the same series as area to match the look) */}
+                {/* Actual area only up to "now" */}
                 <Area
                   type="monotone"
-                  dataKey="value"
-                  stroke="#111827"
+                  dataKey="actual"
+                  stroke={COLORS.areaStroke}
                   fill="url(#areaFill)"
                   strokeWidth={2}
                   dot={false}
                   isAnimationActive={false}
+                  connectNulls={false}
                 />
 
-                {/* Dashed projection line */}
+                {/* Full dashed projection */}
                 <Line
                   type="monotone"
                   dataKey="proj"
@@ -195,60 +243,63 @@ export default function DashboardPage() {
                   isAnimationActive={false}
                 />
 
-                {/* 10-year vertical marker */}
+                {/* fixed-position vertical marker at +10y from start of current year */}
                 <ReferenceLine x={tenYearMarker} stroke="#9ca3af" strokeDasharray="3 3" />
               </AreaChart>
             </ResponsiveContainer>
           </div>
 
-          {/* Zoom & sliders row */}
-          <div className="mt-3 grid grid-cols-1 gap-3">
+          {/* Zoom & sliders in ONE card */}
+          <div className="mt-3 space-y-3">
             <div className="flex items-center gap-2">
               <button
-                onClick={() => setYears((y) => Math.max(5, y - 5))}
+                onClick={() => setYears((y) => Math.max(minYears, y - 1))}
                 className="rounded-md border px-3 py-1 text-sm"
-              >-5</button>
+              >-1</button>
               <button
-                onClick={() => setYears((y) => Math.min(40, y + 5))}
+                onClick={() => setYears((y) => Math.min(maxYears, y + 1))}
                 className="rounded-md border px-3 py-1 text-sm"
-              >+5</button>
+              >+1</button>
+              <span className="ml-2 text-sm text-gray-600">{years} year window</span>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {/* Monthly Contribution slider */}
-              <div className="rounded-xl border p-3">
-                <div className="flex items-center justify-between text-sm">
-                  <span className="font-medium">Monthly Contribution</span>
-                  <span className="text-gray-700">{CAD(monthly)}</span>
+            <div className="rounded-xl border p-3">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {/* Monthly Contribution */}
+                <div>
+                  <div className="flex items-center justify-between text-sm">
+                    <span className="font-medium">Monthly Contribution</span>
+                    <span className="text-gray-700">{CAD(monthly)}</span>
+                  </div>
+                  <input
+                    aria-label="Monthly Contribution"
+                    type="range"
+                    min={0}
+                    max={10000}
+                    step={50}
+                    value={monthly}
+                    onChange={(e) => setMonthly(Number(e.target.value))}
+                    className="mt-2 w-full"
+                  />
                 </div>
-                <input
-                  aria-label="Monthly Contribution"
-                  type="range"
-                  min={0}
-                  max={10000}
-                  step={50}
-                  value={monthly}
-                  onChange={(e) => setMonthly(Number(e.target.value))}
-                  className="mt-2 w-full"
-                />
-              </div>
 
-              {/* Annual Growth slider */}
-              <div className="rounded-xl border p-3">
-                <div className="flex items-center justify-between text-sm">
-                  <span className="font-medium">Annual Growth</span>
-                  <span className="text-gray-700">{growth}%</span>
+                {/* Annual Growth (max 50%) */}
+                <div>
+                  <div className="flex items-center justify-between text-sm">
+                    <span className="font-medium">Annual Growth</span>
+                    <span className="text-gray-700">{growth}%</span>
+                  </div>
+                  <input
+                    aria-label="Annual Growth"
+                    type="range"
+                    min={0}
+                    max={50}
+                    step={0.5}
+                    value={growth}
+                    onChange={(e) => setGrowth(Number(e.target.value))}
+                    className="mt-2 w-full"
+                  />
                 </div>
-                <input
-                  aria-label="Annual Growth"
-                  type="range"
-                  min={0}
-                  max={20}
-                  step={0.5}
-                  value={growth}
-                  onChange={(e) => setGrowth(Number(e.target.value))}
-                  className="mt-2 w-full"
-                />
               </div>
             </div>
           </div>
@@ -258,17 +309,24 @@ export default function DashboardPage() {
         <div className="rounded-2xl border bg-white p-4 shadow-sm">
           <h2 className="mb-2 text-lg font-semibold">Account Allocation</h2>
 
-          <div className="h-[320px]">
+          {/* Prevent SVG focus/click outlines */}
+          <div
+            className="h-[320px] outline-none"
+            onMouseDown={(e) => e.preventDefault()}
+          >
             <ResponsiveContainer width="100%" height="100%">
-              <PieChart>
+              {/* @ts-expect-error focusable is a valid SVG attribute */}
+              <PieChart focusable={false} style={{ outline: 'none' }}>
                 <Pie
                   data={pieData}
                   dataKey="value"
                   nameKey="name"
                   innerRadius={80}
                   outerRadius={120}
-                  strokeWidth={0}
+                  stroke="none"
                   isAnimationActive={false}
+                  // @ts-expect-error focusable is a valid SVG attribute
+                  focusable={false}
                 >
                   {pieData.map((s) => (
                     <Cell key={s.key} fill={s.color} />
