@@ -32,14 +32,14 @@ type Account = {
 };
 
 const COLORS = {
-  tfsa: '#10b981',  // green
-  rrsp: '#3b82f6',  // blue
-  resp: '#f59e0b',  // yellow
+  tfsa: '#10b981',
+  rrsp: '#3b82f6',
+  resp: '#f59e0b',
   grid: '#e5e7eb',
   axis: '#6b7280',
-  areaStroke: '#111827', // black
-  areaFill: '#16a34a',   // green fill
-  dashed: '#16a34a',     // green dashed
+  areaStroke: '#111827',
+  areaFill: '#16a34a',
+  dashed: '#16a34a',
 };
 
 // Custom X tick for month view (bold/larger for January with year label)
@@ -122,10 +122,9 @@ export default function DashboardPage() {
 
     for (let i = 0; i <= totalMonths; i++) {
       const d = new Date(yearNow, 0, 1);
-      d.setMonth(i); // month i from Jan this year
+      d.setMonth(i);
       balance = balance * (1 + monthlyRate) + monthly;
       const ts = d.getTime();
-      // "actual" only until now -> separates the series
       const actual = ts <= nowTs ? balance : null;
       pts.push({ ts, actual, proj: balance });
     }
@@ -317,7 +316,6 @@ export default function DashboardPage() {
             onMouseDown={(e) => e.preventDefault()}
           >
             <ResponsiveContainer width="100%" height="100%">
-              {/* @ts-expect-error focusable is a valid SVG attribute */}
               <PieChart focusable={false} style={{ outline: 'none' }}>
                 <Pie
                   data={pieData}
@@ -327,7 +325,6 @@ export default function DashboardPage() {
                   outerRadius={120}
                   stroke="none"
                   isAnimationActive={false}
-                  // @ts-expect-error focusable is a valid SVG attribute
                   focusable={false}
                 >
                   {pieData.map((s) => (
