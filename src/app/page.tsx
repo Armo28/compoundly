@@ -37,9 +37,9 @@ const COLORS = {
   resp: '#f59e0b',  // yellow
   grid: '#e5e7eb',
   axis: '#6b7280',
-  areaStroke: '#111827', // black for "Actual" line stroke (legend chip)
+  areaStroke: '#111827', // black
   areaFill: '#16a34a',   // green fill
-  dashed: '#16a34a',     // green dashed for projection
+  dashed: '#16a34a',     // green dashed
 };
 
 // Custom X tick for month view (bold/larger for January with year label)
@@ -80,7 +80,7 @@ export default function DashboardPage() {
         if (!mounted) return;
         setAccounts(Array.isArray(j?.items) ? j.items : []);
       } catch {
-        // fall back to zeros; UI stays usable
+        // keep UI usable
       }
     })();
     return () => { mounted = false; };
@@ -99,11 +99,11 @@ export default function DashboardPage() {
     return { total: tfsa + rrsp + resp + other, tfsa, rrsp, resp };
   }, [accounts]);
 
-  // controls (keep your defaults; growth up to 50%)
+  // controls
   const [years, setYears] = useState(20);
   const [monthly, setMonthly] = useState(1000);
   const [growth, setGrowth]   = useState(20); // %
-  const minYears = 2; // requirement
+  const minYears = 2;
   const maxYears = 40;
 
   const yearNow = new Date().getFullYear();
@@ -125,7 +125,7 @@ export default function DashboardPage() {
       d.setMonth(i); // month i from Jan this year
       balance = balance * (1 + monthlyRate) + monthly;
       const ts = d.getTime();
-      // "actual" only until now -> visually separates the series
+      // "actual" only until now -> separates the series
       const actual = ts <= nowTs ? balance : null;
       pts.push({ ts, actual, proj: balance });
     }
@@ -195,13 +195,16 @@ export default function DashboardPage() {
                   type="number"
                   domain={[startTs, endTs]}
                   ticks={xTicks}
-                  tick={isMonthView ? <MonthTick /> : undefined}
+                  {...(
+                    isMonthView
+                      ? { tick: <MonthTick /> }
+                      : { tick: { fill: COLORS.axis, fontSize: 12 } }
+                  )}
                   tickFormatter={
                     isMonthView
                       ? undefined
                       : (ts) => new Date(Number(ts)).getFullYear().toString()
                   }
-                  tick={{ fill: COLORS.axis, fontSize: 12 }}
                   axisLine={{ stroke: COLORS.grid }}
                   tickLine={{ stroke: COLORS.grid }}
                   minTickGap={28}
@@ -243,7 +246,6 @@ export default function DashboardPage() {
                   isAnimationActive={false}
                 />
 
-                {/* fixed-position vertical marker at +10y from start of current year */}
                 <ReferenceLine x={tenYearMarker} stroke="#9ca3af" strokeDasharray="3 3" />
               </AreaChart>
             </ResponsiveContainer>
