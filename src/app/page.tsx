@@ -1,404 +1,311 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
-import { useAuth } from '@/lib/auth';
+import { useMemo, useState } from 'react';
 import {
-  AreaChart,
-  Area,
-  ResponsiveContainer,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  ReferenceDot,
-  PieChart,
-  Pie,
-  Cell,
-  Legend,
+  AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceDot,
+  CartesianGrid, Line, PieChart, Pie, Legend, Cell
 } from 'recharts';
 
-type Account = { id: string; type: 'TFSA'|'RRSP'|'RESP'|'Margin'|'Other'|'LIRA'; balance?: number | null };
-
+// --- colors (keep consistent with your app) ---
 const COLORS = {
-  tfsa: '#22c55e',
-  rrsp: '#60a5fa',
-  resp: '#f59e0b',
   grid: '#e5e7eb',
-  axis: '#111827',
-  actualLine: '#111827',
-  actualFill: 'url(#actualFill)',
-  projLine: '#22c55e',
-  projFill: 'url(#projFill)',
+  axis: '#6b7280',
+  actual: '#111827',
+  proj: '#10b981',
+  projFillFrom: 'rgba(16,185,129,0.22)', // toned down green
+  projFillTo: 'rgba(16,185,129,0.06)',
+  donutTFSA: '#22c55e', // green
+  donutRRSP: '#60a5fa', // blue
+  donutRESP: '#f59e0b', // amber
 };
 
-const CAD = (n: number) =>
-  n.toLocaleString(undefined, { style: 'currency', currency: 'CAD', maximumFractionDigits: 0 });
-
-/** Generate an inclusive sequence of months starting at `start` (UTC), length `count`. */
-function genMonths(start: Date, count: number): Date[] {
-  const out: Date[] = [];
-  for (let i = 0; i < count; i++) {
-    const d = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + i, 1));
-    out.push(d);
-  }
-  return out;
+// Round to month start for stable ticks
+function startOfMonth(d: Date) {
+  const n = new Date(d);
+  n.setDate(1); n.setHours(0, 0, 0, 0);
+  return n;
+}
+function addMonths(d: Date, m: number) {
+  const n = new Date(d);
+  n.setMonth(n.getMonth() + m);
+  return n;
+}
+function addYears(d: Date, y: number) {
+  const n = new Date(d);
+  n.setFullYear(n.getFullYear() + y);
+  return n;
+}
+function monthsBetween(a: Date, b: Date) {
+  return (b.getFullYear() - a.getFullYear()) * 12 + (b.getMonth() - a.getMonth());
 }
 
-/** Simple monthly compounding from a starting value. */
-function projectSeries(opts: {
-  startValue: number;
-  monthlyContribution: number;
-  annualGrowthPct: number; // 0..100
-  months: number;
-}) {
-  const r = opts.annualGrowthPct / 100 / 12;
-  const out: number[] = [];
-  let v = opts.startValue;
-  for (let i = 0; i < opts.months; i++) {
-    v = v * (1 + r) + opts.monthlyContribution;
-    out.push(v);
-  }
-  return out;
+// format 0 → 0, 120000 → 120K, 1500000 → 1.5M
+function formatCompact(n: number) {
+  const abs = Math.abs(n);
+  if (abs >= 1_000_000) return `${(n / 1_000_000).toFixed(abs >= 10_000_000 ? 0 : 1)}M`;
+  if (abs >= 1_000) return `${(n / 1_000).toFixed(abs >= 10_000 ? 0 : 1)}K`;
+  return `${n}`;
 }
 
-type ChartPoint = { ts: number; actual?: number | null; proj?: number | null };
+// Fake portfolio split from accounts API (replace with your real totals if you have them on this page)
+const totals = { tfsa: 25000, rrsp: 50000, resp: 15000 };
+const totalEquity = totals.tfsa + totals.rrsp + totals.resp;
 
-export default function DashboardPage() {
-  const { session } = useAuth();
-  const token = session?.access_token ?? '';
+type Point = { t: number; v: number };
 
-  // --- Fetch accounts for donut / total ---
-  const [loading, setLoading] = useState(true);
-  const [err, setErr]       = useState<string | null>(null);
-  const [accounts, setAccounts] = useState<Account[]>([]);
+export default function Dashboard() {
+  // window & controls
+  const [windowYears, setWindowYears] = useState(1);         // default small window makes the monthly ticks visible
+  const [monthly, setMonthly] = useState(1000);
+  const [growthPct, setGrowthPct] = useState(10);            // 10% default
 
-  useEffect(() => {
-    let mounted = true;
-    (async () => {
-      if (!token) { setLoading(false); return; }
-      setLoading(true);
-      setErr(null);
-      try {
-        const r = await fetch('/api/accounts', {
-          headers: token ? { authorization: `Bearer ${token}` } : {},
-        });
-        const j = await r.json();
-        if (!j?.ok) throw new Error(j?.error ?? 'Failed to load accounts');
-        if (!mounted) return;
-        setAccounts(j.items ?? []);
-      } catch (e:any) {
-        if (!mounted) return;
-        setErr(e?.message || 'Error');
-      } finally {
-        if (mounted) setLoading(false);
-      }
-    })();
-    return () => { mounted = false; };
-  }, [token]);
+  const now = startOfMonth(new Date());
+  const left = startOfMonth(addYears(now, -windowYears));
+  const right = startOfMonth(addYears(now, windowYears));
 
-  const totals = useMemo(() => {
-    const sum = (t: Account['type']) =>
-      accounts.filter(a => a.type === t).reduce((acc, a) => acc + (a.balance ?? 0), 0);
-    const tfsa = sum('TFSA');
-    const rrsp = sum('RRSP');
-    const resp = sum('RESP');
-    const total = tfsa + rrsp + resp;
-    return { tfsa, rrsp, resp, total };
-  }, [accounts]);
+  const series = useMemo(() => {
+    // Build a month-by-month series across the full window
+    const months = monthsBetween(left, right);
+    const data: Point[] = [];
+    const actual: Point[] = [];
+    const proj: Point[] = [];
 
-  // --- Controls ---
-  const [windowYears, setWindowYears] = useState(1);  // +/- buttons update this
-  const [monthly, setMonthly] = useState(1000);       // slider shows CAD$1,000 default
-  const [growth, setGrowth]   = useState(10);         // 10% default
+    // simple compounding forward from the left edge to provide a smooth baseline
+    let value = totalEquity; // assume left edge approx equals current total; you can backfill from snapshots if you have them
+    const r = Math.pow(1 + growthPct / 100, 1 / 12) - 1; // monthly rate
 
-  const windowMonths = Math.max(12, Math.min(600, Math.round(windowYears * 12)));
-  const startMonth = useMemo(() => {
-    // start at current month (UTC, day 1) minus (windowMonths-1), so last point is "now month"
-    const now = new Date();
-    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - (windowMonths - 1), 1));
-  }, [windowMonths]);
-
-  // --- Build chart data ---
-  const data: ChartPoint[] = useMemo(() => {
-    const months = genMonths(startMonth, windowMonths);
-    // "Actual" series: ensure at least 2 points so the line & fill are visible
-    // For now, we synthesize a flat line equal to today's total for the last two months.
-    const totalNow = totals.total || 0;
-    const actualEndIndex = months.length >= 2 ? months.length - 1 : 0;
-    const actualStartIndex = Math.max(0, actualEndIndex - 1);
-
-    // Projected series begins AFTER the last actual point
-    const projHorizon = months.length - (actualEndIndex + 1);
-    const projValues =
-      projHorizon > 0
-        ? projectSeries({
-            startValue: totalNow,
-            monthlyContribution: monthly,
-            annualGrowthPct: growth,
-            months: projHorizon,
-          })
-        : [];
-
-    const rows: ChartPoint[] = months.map((d, i) => {
-      const ts = +d;
-      if (i < actualStartIndex) {
-        // before our minimal actual coverage: nothing
-        return { ts, actual: null, proj: null };
-      }
-      if (i === actualStartIndex || i === actualEndIndex) {
-        return { ts, actual: totalNow, proj: null };
-      }
-      // After last actual = projection only
-      const projIndex = i - (actualEndIndex + 1);
-      const projVal = projIndex >= 0 ? projValues[projIndex] : null;
-      return { ts, actual: null, proj: projVal ?? null };
-    });
-
-    // Edge case: very small windows => guarantee two points present for actual
-    if (rows.filter(r => r.actual != null).length < 2) {
-      if (rows.length >= 2) {
-        rows[rows.length - 2].actual = totalNow;
-        rows[rows.length - 1].actual = totalNow;
-      }
+    // generate base line from left→right
+    for (let i = 0; i <= months; i++) {
+      const t = startOfMonth(addMonths(left, i)).getTime();
+      // apply monthly contribution and growth
+      value = value * (1 + r) + monthly;
+      data.push({ t, v: value });
     }
 
-    return rows;
-  }, [startMonth, windowMonths, totals.total, monthly, growth]);
+    // split into actual (≤ now) and projection (> now), BUT ensure the very first “actual” point exists
+    for (const p of data) {
+      if (p.t <= now.getTime()) actual.push(p);
+      else proj.push(p);
+    }
+    // guard: if window is all-projection (e.g., tiny window), add one actual “now” point
+    if (actual.length === 0) {
+      const idxNow = data.findIndex(p => p.t >= now.getTime());
+      if (idxNow >= 0) actual.push({ t: now.getTime(), v: data[idxNow].v });
+      else actual.push({ t: now.getTime(), v: value });
+    }
+    // Ensure projection starts exactly where actual ends (duplicate boundary point to avoid visual gap)
+    if (proj.length) {
+      const lastA = actual[actual.length - 1];
+      if (proj[0].t !== lastA.t) proj.unshift({ t: lastA.t, v: lastA.v });
+    }
 
-  const xIsMonthly = windowMonths <= 24;
+    return { actual, proj };
+  }, [left, right, monthly, growthPct]);
 
-  // Tooltips: show a single line with whichever value exists
-  const tooltipFormatter = (val: any, name: string) => {
-    return [CAD(Number(val)), name === 'actual' ? 'Actual' : 'Projection'];
-  };
+  const monthTicks = useMemo(() => {
+    // ≤ 24 months → monthly ticks; else, yearly ticks (Jan)
+    const totalMonths = monthsBetween(left, right);
+    const ticks: number[] = [];
+    if (totalMonths <= 24) {
+      for (let i = 0; i <= totalMonths; i++) {
+        ticks.push(startOfMonth(addMonths(left, i)).getTime());
+      }
+    } else {
+      for (let y = left.getFullYear(); y <= right.getFullYear(); y++) {
+        ticks.push(new Date(y, 0, 1).getTime());
+      }
+    }
+    return ticks;
+  }, [left, right]);
 
-  const pieData = useMemo(
-    () => [
-      { name: 'TFSA', value: totals.tfsa, color: COLORS.tfsa },
-      { name: 'RRSP', value: totals.rrsp, color: COLORS.rrsp },
-      { name: 'RESP', value: totals.resp, color: COLORS.resp },
-    ],
-    [totals],
-  );
+  // donut data (order: TFSA, RRSP, RESP)
+  const pieData = [
+    { name: 'TFSA', value: totals.tfsa, color: COLORS.donutTFSA },
+    { name: 'RRSP', value: totals.rrsp, color: COLORS.donutRRSP },
+    { name: 'RESP', value: totals.resp, color: COLORS.donutRESP },
+  ];
 
   return (
-    <main className="max-w-7xl mx-auto p-4 space-y-4">
-      <section className="rounded-2xl border bg-white p-4 shadow-sm">
-        <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
-          {/* Left: line/area chart */}
-          <div className="lg:col-span-3">
-            <div className="text-lg font-semibold mb-2">Portfolio Value (Actual &amp; Projected)</div>
-            <div className="h-[380px] w-full">
-              <ResponsiveContainer width="100%" height="100%">
-                <AreaChart
-                  data={data}
-                  margin={{ top: 8, right: 12, bottom: 8, left: 8 }} // extra left pad so Y labels never clip
-                >
-                  <defs>
-                    {/* subtle gray for actual area */}
-                    <linearGradient id="actualFill" x1="0" x2="0" y1="0" y2="1">
-                      <stop offset="0%" stopColor="#6b7280" stopOpacity={0.16} />
-                      <stop offset="100%" stopColor="#6b7280" stopOpacity={0.04} />
-                    </linearGradient>
-                    {/* toned-down green for projection area */}
-                    <linearGradient id="projFill" x1="0" x2="0" y1="0" y2="1">
-                      <stop offset="0%" stopColor="#22c55e" stopOpacity={0.18} />
-                      <stop offset="100%" stopColor="#22c55e" stopOpacity={0.06} />
-                    </linearGradient>
-                  </defs>
+    <main className="mx-auto max-w-7xl p-4 space-y-4">
+      <section className="grid grid-cols-1 lg:grid-cols-5 gap-4">
+        {/* Left: chart */}
+        <div className="lg:col-span-3 rounded-2xl border bg-white p-4 shadow-sm">
+          <div className="mb-2 text-lg font-semibold">Portfolio Value (Actual &amp; Projected)</div>
 
-                  <CartesianGrid stroke={COLORS.grid} vertical={false} />
+          <div className="h-[360px]">
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={series.actual}>
+                <defs>
+                  <linearGradient id="projFill" x1="0" x2="0" y1="0" y2="1">
+                    <stop offset="0%" stopColor={COLORS.projFillFrom} />
+                    <stop offset="100%" stopColor={COLORS.projFillTo} />
+                  </linearGradient>
+                  <linearGradient id="actualFill" x1="0" x2="0" y1="0" y2="1">
+                    <stop offset="0%" stopColor="rgba(17,24,39,0.16)" />
+                    <stop offset="100%" stopColor="rgba(17,24,39,0.04)" />
+                  </linearGradient>
+                </defs>
 
-                  <XAxis
-                    dataKey="ts"
-                    type="number"
-                    domain={['dataMin', 'dataMax']}
-                    tickFormatter={
-                      xIsMonthly
-                        ? (ts) => new Date(Number(ts)).toLocaleString(undefined, { month: 'short' })
-                        : (ts) => new Date(Number(ts)).getFullYear().toString()
-                    }
-                    tick={{ fill: COLORS.axis, fontSize: 12 }}
-                    tickLine={{ stroke: COLORS.grid }}
-                    axisLine={{ stroke: COLORS.grid }}
-                    minTickGap={xIsMonthly ? 10 : 28}
-                    allowDecimals={false}
-                  />
+                <CartesianGrid stroke={COLORS.grid} vertical={false} />
 
-                  <YAxis
-                    width={52}
-                    tickFormatter={(v) =>
-                      Number(v).toLocaleString(undefined, { maximumFractionDigits: 0 })
-                        .replace(/000$/, 'K') // 90,000 -> 90K (simple, readable)
-                    }
-                    tick={{ fill: COLORS.axis, fontSize: 12 }}
-                    tickLine={{ stroke: COLORS.grid }}
-                    axisLine={{ stroke: COLORS.grid }}
-                    allowDecimals={false}
-                  />
+                <XAxis
+                  dataKey="t"
+                  type="number"
+                  domain={[left.getTime(), right.getTime()]}
+                  ticks={monthTicks}
+                  tickFormatter={(ts) => {
+                    const d = new Date(Number(ts));
+                    return monthTicks.length <= 25
+                      ? d.toLocaleString(undefined, { month: 'short' }) // monthly view
+                      : d.getFullYear().toString();                      // yearly view
+                  }}
+                  tick={{ fill: COLORS.axis, fontSize: 12 }}
+                  axisLine={{ stroke: COLORS.grid }}
+                  tickLine={{ stroke: COLORS.grid }}
+                  minTickGap={16}
+                />
 
-                  <Tooltip
-                    formatter={tooltipFormatter}
-                    labelFormatter={(ts) =>
-                      new Date(Number(ts)).toLocaleDateString(undefined, {
-                        year: 'numeric',
-                        month: xIsMonthly ? 'short' : undefined,
-                      })
-                    }
-                  />
+                <YAxis
+                  width={46}
+                  tickFormatter={(v) => formatCompact(Math.round(v))}
+                  tick={{ fill: COLORS.axis, fontSize: 12 }}
+                  axisLine={{ stroke: COLORS.grid }}
+                  tickLine={{ stroke: COLORS.grid }}
+                />
 
-                  {/* visible starting dot for actual */}
-                  {data.length > 0 && (
-                    <ReferenceDot
-                      x={data.find((d) => d.actual != null)?.ts ?? data[0].ts}
-                      y={data.find((d) => d.actual != null)?.actual ?? totals.total}
-                      r={3}
-                      fill={COLORS.actualLine}
-                      stroke="none"
-                    />
-                  )}
+                {/* ACTUAL (solid line + fill) */}
+                <Area
+                  type="monotone"
+                  dataKey="v"
+                  stroke={COLORS.actual}
+                  fill="url(#actualFill)"
+                  strokeWidth={2}
+                  isAnimationActive={false}
+                  name="Actual"
+                />
 
-                  {/* Actual up to now */}
-                  <Area
-                    dataKey="actual"
-                    type="monotone"
-                    stroke={COLORS.actualLine}
-                    strokeWidth={2}
-                    fill={COLORS.actualFill}
-                    dot={false}
-                    isAnimationActive={false}
-                    connectNulls={false}
-                  />
+                {/* A reference dot marking “now” */}
+                <ReferenceDot x={now.getTime()} y={series.actual.at(-1)?.v ?? totalEquity} r={3} stroke={COLORS.actual} fill={COLORS.actual} />
 
-                  {/* Projection AFTER actual */}
-                  <Area
-                    dataKey="proj"
-                    type="monotone"
-                    stroke={COLORS.projLine}
-                    strokeWidth={2}
-                    strokeDasharray="6 6"
-                    fill={COLORS.projFill}
-                    dot={false}
-                    isAnimationActive={false}
-                    connectNulls={false}
-                  />
-                </AreaChart>
-              </ResponsiveContainer>
+                {/* PROJECTION rendered as *separate* dataset, dashed + fill */}
+                <Area
+                  type="monotone"
+                  data={series.proj}
+                  dataKey="v"
+                  stroke={COLORS.proj}
+                  strokeDasharray="6 6"
+                  strokeWidth={2}
+                  fill="url(#projFill)"
+                  isAnimationActive={false}
+                  name="Projection"
+                />
+
+                <Tooltip
+                  cursor={{ stroke: COLORS.grid }}
+                  formatter={(val: any) => [`CA$${Number(val).toLocaleString()}`, 'value']}
+                  labelFormatter={(ts) =>
+                    new Date(Number(ts)).toLocaleDateString(undefined, {
+                      year: 'numeric',
+                      month: monthTicks.length <= 25 ? 'short' : undefined,
+                    })
+                  }
+                />
+              </AreaChart>
+            </ResponsiveContainer>
+          </div>
+
+          {/* Controls */}
+          <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div className="rounded-xl border p-3">
+              <div className="flex items-center justify-between text-sm mb-1">
+                <span>Monthly Contribution</span>
+                <span>CA${monthly.toLocaleString()}</span>
+              </div>
+              <input
+                type="range"
+                min={0}
+                max={5000}
+                step={50}
+                value={monthly}
+                onChange={(e) => setMonthly(Number(e.target.value))}
+                className="w-full"
+              />
             </div>
 
-            {/* Sliders */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
-              <div className="rounded-xl border px-3 py-2">
-                <div className="flex items-center justify-between text-sm mb-1">
-                  <span>Monthly Contribution</span>
-                  <span className="font-medium">{CAD(monthly)}</span>
-                </div>
-                <input
-                  type="range"
-                  min={0}
-                  max={5000}
-                  step={50}
-                  value={monthly}
-                  onChange={(e) => setMonthly(Number(e.target.value))}
-                  className="w-full"
-                />
+            <div className="rounded-xl border p-3">
+              <div className="flex items-center justify-between text-sm mb-1">
+                <span>Annual Growth</span>
+                <span>{growthPct}%</span>
               </div>
-
-              <div className="rounded-xl border px-3 py-2">
-                <div className="flex items-center justify-between text-sm mb-1">
-                  <span>Annual Growth</span>
-                  <span className="font-medium">{growth}%</span>
-                </div>
-                <input
-                  type="range"
-                  min={0}
-                  max={50}
-                  step={1}
-                  value={growth}
-                  onChange={(e) => setGrowth(Number(e.target.value))}
-                  className="w-full"
-                />
-              </div>
-            </div>
-
-            {/* Zoom controls */}
-            <div className="flex items-center gap-2 mt-3">
-              <button
-                onClick={() => setWindowYears(Math.max(0.5, windowYears - 1))}
-                className="rounded-md border px-3 py-1"
-              >
-                −1
-              </button>
-              <button
-                onClick={() => setWindowYears(Math.min(50, windowYears + 1))}
-                className="rounded-md border px-3 py-1"
-              >
-                +1
-              </button>
-              <div className="text-sm text-gray-600 ml-2">{windowYears} year window</div>
+              <input
+                type="range"
+                min={0}
+                max={50}
+                step={1}
+                value={growthPct}
+                onChange={(e) => setGrowthPct(Number(e.target.value))}
+                className="w-full"
+              />
             </div>
           </div>
 
-          {/* Right: donut */}
-          <div className="lg:col-span-2">
-            <div className="text-lg font-semibold mb-2">Account Allocation</div>
-            <div className="h-[340px] w-full">
-              <div className="h-full w-full outline-none focus:outline-none focus-visible:outline-none">
-                <ResponsiveContainer width="100%" height="100%">
-                  <PieChart>
-                    <Pie
-                      data={pieData}
-                      dataKey="value"
-                      nameKey="name"
-                      innerRadius="60%"
-                      outerRadius="80%"
-                      isAnimationActive={false}
-                    >
-                      {pieData.map((s, i) => (
-                        <Cell key={i} fill={s.color} stroke="transparent" />
-                      ))}
-                    </Pie>
-                    {/* Center total */}
-                    <text
-                      x="50%"
-                      y="50%"
-                      textAnchor="middle"
-                      dominantBaseline="middle"
-                      fontSize="14"
-                      fill="#374151"
-                    >
-                      Total
-                    </text>
-                    <text
-                      x="50%"
-                      y="58%"
-                      textAnchor="middle"
-                      dominantBaseline="middle"
-                      fontSize="20"
-                      fontWeight={700}
-                      fill="#111827"
-                    >
-                      {CAD(totals.total)}
-                    </text>
-                    <Legend
-                      verticalAlign="bottom"
-                      align="center"
-                      iconType="circle"
-                      formatter={(v) => v}
-                    />
-                  </PieChart>
-                </ResponsiveContainer>
-              </div>
-            </div>
+          <div className="mt-3 flex items-center gap-2">
+            <button
+              onClick={() => setWindowYears((y) => Math.max(1, y - 1))}
+              className="rounded border px-3 py-1"
+            >
+              −1
+            </button>
+            <button
+              onClick={() => setWindowYears((y) => Math.min(40, y + 1))}
+              className="rounded border px-3 py-1"
+            >
+              +1
+            </button>
+            <div className="text-sm text-gray-600">{windowYears} year window</div>
           </div>
         </div>
 
-        {loading && (
-          <div className="text-sm text-gray-500 mt-2">Loading accounts…</div>
-        )}
-        {err && (
-          <div className="text-sm text-red-600 mt-2">{err}</div>
-        )}
+        {/* Right: donut */}
+        <div className="lg:col-span-2 rounded-2xl border bg-white p-4 shadow-sm">
+          <div className="mb-2 text-lg font-semibold">Account Allocation</div>
+
+          <div className="h-[320px]">
+            <ResponsiveContainer width="100%" height="100%">
+              <PieChart>
+                <Pie
+                  data={pieData}
+                  dataKey="value"
+                  nameKey="name"
+                  innerRadius={80}
+                  outerRadius={120}
+                  stroke="none"
+                  isAnimationActive={false}
+                >
+                  {pieData.map((s) => (
+                    <Cell key={s.name} fill={s.color} />
+                  ))}
+                </Pie>
+
+                {/* centered total */}
+                <text x="50%" y="46%" textAnchor="middle" dominantBaseline="middle" className="fill-gray-500 text-sm">
+                  Total
+                </text>
+                <text x="50%" y="56%" textAnchor="middle" dominantBaseline="middle" className="fill-gray-900 text-xl font-semibold">
+                  CA${totalEquity.toLocaleString()}
+                </text>
+
+                <Legend
+                  verticalAlign="bottom"
+                  align="center"
+                  iconType="circle"
+                  wrapperStyle={{ outline: 'none' }}
+                  formatter={(val) => <span style={{ color: '#111827' }}>{val}</span>}
+                />
+              </PieChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
       </section>
     </main>
   );
