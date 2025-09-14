@@ -1,258 +1,290 @@
+// src/app/page.tsx
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
-import { useAuth } from '@/lib/auth';
 import {
-  AreaChart, Area,
-  LineChart, Line,
-  XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
-  PieChart, Pie, Cell
+  ResponsiveContainer,
+  ComposedChart,
+  Area,
+  Line,
+  XAxis,
+  YAxis,
+  Tooltip,
+  CartesianGrid,
 } from 'recharts';
+import {
+  PieChart,
+  Pie,
+  Cell,
+  Legend,
+} from 'recharts';
+import { useAuth } from '@/lib/auth';
+
+/** ---------- helpers ---------- */
+
+const CAD = (n: number) =>
+  n.toLocaleString(undefined, { style: 'currency', currency: 'CAD', maximumFractionDigits: 0 });
+
+const CAD_SHORT = (n: number) =>
+  // Compact (CA$1.2M / CA$250K) but keep currency
+  new Intl.NumberFormat(undefined, {
+    style: 'currency',
+    currency: 'CAD',
+    notation: 'compact',
+    maximumFractionDigits: 1,
+  }).format(n);
 
 type Account = {
   id: string;
-  type: 'TFSA' | 'RRSP' | 'RESP' | 'Margin' | 'Other' | 'LIRA';
-  balance: number | null;
+  type: 'TFSA' | 'RRSP' | 'RESP' | string;
+  balance?: number | null;
 };
 
-const CAD = (n: number) =>
-  (n || 0).toLocaleString(undefined, { style: 'currency', currency: 'CAD', maximumFractionDigits: 0 });
+type Allocation = { tfsa: number; rrsp: number; resp: number; other: number; total: number };
 
-/* ---------------------- helpers ---------------------- */
-
-function authHeaders(token?: string): HeadersInit {
-  const h = new Headers();
-  if (token) h.set('authorization', `Bearer ${token}`);
-  return h as HeadersInit;
+/** Build monthly projection points */
+function buildSeries(startTs: number, months: number, monthly: number, annualPct: number, initialValue: number) {
+  const r = annualPct / 100 / 12; // monthly rate
+  let value = initialValue;
+  const data: Array<{ ts: number; actual: number; projection: number }> = [];
+  for (let i = 0; i <= months; i++) {
+    const ts = new Date(startTs);
+    ts.setMonth(ts.getMonth() + i);
+    // Simple compound: add contribution, then grow remaining (end-of-period contributions)
+    value = value * (1 + r) + monthly;
+    data.push({ ts: ts.getTime(), actual: value, projection: value });
+  }
+  return data;
 }
 
-function jan1Ticks(fromYear: number, toYear: number, maxTicks = 12): number[] {
+/** Jan 1 ticks between start and end; string labels to satisfy recharts typing */
+function yearTicksBetween(start: Date, end: Date, stepYears = 2): Array<number> {
   const ticks: number[] = [];
-  for (let y = fromYear; y <= toYear; y++) ticks.push(Date.UTC(y, 0, 1));
-
-  if (ticks.length <= maxTicks) return ticks;
-
-  // Downsample to avoid overlap when zoomed far out
-  const step = Math.ceil(ticks.length / maxTicks);
-  const filtered: number[] = [];
-  for (let i = 0; i < ticks.length; i += step) filtered.push(ticks[i]);
-  // ensure last year tick present
-  if (filtered[filtered.length - 1] !== ticks[ticks.length - 1]) {
-    filtered.push(ticks[ticks.length - 1]);
+  const y0 = start.getFullYear();
+  const y1 = end.getFullYear();
+  for (let y = y0; y <= y1; y += stepYears) {
+    const d = new Date(Date.UTC(y, 0, 1)); // Jan 1 UTC
+    ticks.push(d.getTime());
   }
-  return filtered;
+  return ticks;
 }
 
-/** Monthly compounding with monthly contributions */
-function buildProjectionSeries(params: {
-  startTotal: number;
-  monthlyContribution: number;
-  annualGrowthPct: number;
-  years: number;
-}) {
-  const { startTotal, monthlyContribution, annualGrowthPct, years } = params;
-  const monthlyRate = Math.pow(1 + annualGrowthPct / 100, 1 / 12) - 1;
-
-  const points: { ts: number; value: number }[] = [];
-  let value = startTotal;
-
-  const now = new Date();
-  const start = Date.UTC(now.getUTCFullYear(), 0, 1); // Jan 1 current year
-  const totalMonths = years * 12;
-
-  for (let m = 0; m <= totalMonths; m++) {
-    // timestamp at month m from Jan 1 current year
-    const dt = new Date(start);
-    dt.setUTCMonth(dt.getUTCMonth() + m);
-    points.push({ ts: dt.getTime(), value });
-
-    // grow + contribute for next step
-    value = value * (1 + monthlyRate) + monthlyContribution;
-  }
-
-  return points;
-}
-
-/* ---------------------- component ---------------------- */
+/** ---------- page ---------- */
 
 export default function DashboardPage() {
   const { session } = useAuth();
   const token = session?.access_token ?? '';
 
-  // zoom horizon (years)
-  const [years, setYears] = useState<number>(15);
+  // sliders: defaults requested
+  const [monthly, setMonthly] = useState(1000);   // CA$1,000
+  const [growth, setGrowth] = useState(10);       // 10%
+  const [horizonY, setHorizonY] = useState(40);   // years shown (+/- buttons control)
 
-  // sliders (defaults requested)
-  const [monthlyContribution, setMonthlyContribution] = useState<number>(1000);
-  const [annualGrowth, setAnnualGrowth] = useState<number>(10);
+  const [alloc, setAlloc] = useState<Allocation>({ tfsa: 0, rrsp: 0, resp: 0, other: 0, total: 0 });
+  const [loadingAlloc, setLoadingAlloc] = useState(true);
 
-  // accounts -> allocation + starting equity
-  const [alloc, setAlloc] = useState<{ TFSA: number; RRSP: number; RESP: number; Other: number }>({
-    TFSA: 0, RRSP: 0, RESP: 0, Other: 0
-  });
-
+  /** Fetch accounts to compute allocation donut */
   useEffect(() => {
     let mounted = true;
     (async () => {
+      setLoadingAlloc(true);
       try {
-        const r = await fetch('/api/accounts', { headers: authHeaders(token) });
+        const headers: HeadersInit = token ? { authorization: `Bearer ${token}` } : {};
+        const r = await fetch('/api/accounts', { headers });
         const j = await r.json();
-        const items: Account[] = j?.items ?? [];
+        const items: Account[] = Array.isArray(j?.items) ? j.items : [];
+        if (!mounted) return;
 
-        const sums = { TFSA: 0, RRSP: 0, RESP: 0, Other: 0 };
-        for (const a of items) {
-          const v = a.balance ?? 0;
-          if (a.type === 'TFSA') sums.TFSA += v;
-          else if (a.type === 'RRSP') sums.RRSP += v;
-          else if (a.type === 'RESP') sums.RESP += v;
-          else sums.Other += v;
-        }
-        if (mounted) setAlloc(sums);
+        const sum = (xs: Account[], pred: (a: Account) => boolean) =>
+          xs.reduce((acc, a) => acc + (pred(a) ? (a.balance ?? 0) : 0), 0);
+
+        const tfsa = sum(items, a => a.type === 'TFSA');
+        const rrsp = sum(items, a => a.type === 'RRSP');
+        const resp = sum(items, a => a.type === 'RESP');
+        const total = sum(items, () => true);
+        const other = Math.max(0, total - tfsa - rrsp - resp);
+
+        setAlloc({ tfsa, rrsp, resp, other, total });
       } catch {
-        /* ignore */
+        if (!mounted) return;
+        setAlloc({ tfsa: 0, rrsp: 0, resp: 0, other: 0, total: 0 });
+      } finally {
+        if (mounted) setLoadingAlloc(false);
       }
     })();
     return () => { mounted = false; };
   }, [token]);
 
-  const startTotal = alloc.TFSA + alloc.RRSP + alloc.RESP + alloc.Other;
+  /** Projection series (actual area & projection line share the same numbers but use different keys) */
+  const series = useMemo(() => {
+    const start = new Date();
+    start.setHours(0, 0, 0, 0);
+    start.setUTCDate(1); // normalize to day 1
+    const months = Math.max(12, horizonY * 12);
+    return buildSeries(start.getTime(), months, monthly, growth, alloc.total);
+  }, [monthly, growth, horizonY, alloc.total]);
 
-  const series = useMemo(
-    () => buildProjectionSeries({
-      startTotal,
-      monthlyContribution,
-      annualGrowthPct: annualGrowth,
-      years
-    }),
-    [startTotal, monthlyContribution, annualGrowth, years]
-  );
+  /** X axis ticks: Jan 1 every 2–3 years depending on horizon */
+  const xTicks = useMemo(() => {
+    if (!series.length) return [];
+    const start = new Date(series[0].ts);
+    const end = new Date(series[series.length - 1].ts);
+    const spanYears = end.getFullYear() - start.getFullYear();
+    const step = spanYears > 36 ? 4 : spanYears > 24 ? 3 : 2;
+    return yearTicksBetween(start, end, step);
+  }, [series]);
 
-  const startYear = new Date(series[0]?.ts ?? Date.UTC(new Date().getUTCFullYear(), 0, 1)).getUTCFullYear();
-  const endYear = new Date(series[series.length - 1]?.ts ?? Date.UTC(new Date().getUTCFullYear() + years, 0, 1)).getUTCFullYear();
-  const ticks = useMemo(() => jan1Ticks(startYear, endYear, 12), [startYear, endYear]);
+  /** Colors (match your theme) */
+  const GREEN = '#16a34a';
+  const GREEN_LIGHT = '#bbf7d0';
+  const BLUE = '#2563eb';
+  const YELLOW = '#f59e0b';
+  const GRAY = '#e5e7eb';
 
-  const totalEquity = startTotal;
-  const pieData = [
-    { name: 'TFSA', value: alloc.TFSA },
-    { name: 'RRSP', value: alloc.RRSP },
-    { name: 'RESP', value: alloc.RESP },
+  /** Donut data */
+  const donut = [
+    { name: 'TFSA', value: alloc.tfsa, color: GREEN },
+    { name: 'RRSP', value: alloc.rrsp, color: BLUE },
+    { name: 'RESP', value: alloc.resp, color: YELLOW },
   ];
-  const pieColors = ['#22c55e', '#60a5fa', '#facc15'];
 
   return (
-    <main className="mx-auto max-w-6xl p-4 space-y-4">
-
-      {/* Chart card */}
-      <section className="rounded-2xl border bg-white p-4 shadow-sm">
-        <div className="text-lg font-semibold mb-3">Portfolio Value (Actual &amp; Projected)</div>
-
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Left: chart */}
-          <div className="lg:col-span-2" style={{ width: '100%', height: 360 }}>
-            <ResponsiveContainer>
-              <AreaChart data={series} margin={{ top: 12, right: 24, bottom: 12, left: 0 }}>
-                <defs>
-                  <linearGradient id="fillArea" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#111827" stopOpacity={0.15} />
-                    <stop offset="100%" stopColor="#111827" stopOpacity={0.02} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" />
+    <main className="max-w-7xl mx-auto p-4 space-y-6">
+      <section className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <div className="lg:col-span-2 rounded-2xl border bg-white p-4 shadow-sm">
+          <div className="text-lg font-semibold mb-2">Portfolio Value (Actual &amp; Projected)</div>
+          <div className="h-[380px]">
+            <ResponsiveContainer width="100%" height="100%">
+              <ComposedChart
+                data={series}
+                margin={{ top: 12, right: 24, bottom: 8, left: 0 }}
+              >
+                <CartesianGrid stroke={GRAY} vertical={false} />
                 <XAxis
                   dataKey="ts"
                   type="number"
                   domain={['dataMin', 'dataMax']}
-                  ticks={ticks}
-                  interval={0} // show all provided ticks
-                  minTickGap={28}
-                  tickFormatter={(value) => new Date(Number(value)).getUTCFullYear().toString()}
-                  allowDecimals={false}
+                  ticks={xTicks}
+                  tickFormatter={(ts) => new Date(ts as number).getFullYear().toString()}
+                  interval="preserveStartEnd"
+                  minTickGap={22}
+                  tickLine={false}
                 />
                 <YAxis
-                  width={64}
-                  tickFormatter={(n) => CAD(Number(n))}
+                  width={90}
+                  tickFormatter={(v) => CAD_SHORT(Number(v))}
+                  tickLine={false}
                 />
                 <Tooltip
-                  labelFormatter={(v) => new Date(Number(v)).toUTCString().slice(5, 16)}
-                  formatter={(val: any) => CAD(Number(val))}
+                  formatter={(value, name) => [CAD(Number(value)), name === 'actual' ? 'Actual' : 'Projection']}
+                  labelFormatter={(ts) => new Date(ts as number).toLocaleDateString(undefined, {
+                    year: 'numeric',
+                    month: 'short',
+                    day: '2-digit'
+                  })}
                 />
-                {/* "Actual" (filled area) – if you add historical, bind to another key */}
-                <Area type="monotone" dataKey="value" stroke="#111827" fill="url(#fillArea)" />
-                {/* Projection line (dashed) */}
-                <Line type="monotone" dataKey="value" stroke="#22c55e" strokeDasharray="6 6" dot={false} />
-              </AreaChart>
+                {/* Actual (filled area) */}
+                <Area
+                  type="monotone"
+                  dataKey="actual"
+                  stroke="#111827"
+                  fill="#111827"
+                  fillOpacity={0.08}
+                  dot={false}
+                  isAnimationActive={false}
+                />
+                {/* Projection (green dashed line) */}
+                <Line
+                  type="monotone"
+                  dataKey="projection"
+                  stroke={GREEN}
+                  strokeWidth={2}
+                  dot={false}
+                  isAnimationActive={false}
+                  strokeDasharray="6 6"
+                />
+              </ComposedChart>
             </ResponsiveContainer>
-
-            {/* Zoom controls */}
-            <div className="mt-3 flex items-center gap-3">
-              <button
-                className="rounded-md border px-3 py-1.5"
-                onClick={() => setYears((y) => Math.max(5, y - 5))}
-              >
-                −5
-              </button>
-              <button
-                className="rounded-md border px-3 py-1.5"
-                onClick={() => setYears((y) => Math.min(40, y + 5))}
-              >
-                +5
-              </button>
-            </div>
           </div>
 
-          {/* Right: allocation donut */}
-          <div className="rounded-xl border p-4">
-            <div className="text-sm font-medium">Account Allocation</div>
-            <div className="mt-2" style={{ width: '100%', height: 240 }}>
-              <ResponsiveContainer>
-                <PieChart>
-                  <Pie data={pieData} dataKey="value" innerRadius={60} outerRadius={90} paddingAngle={2}>
-                    {pieData.map((_, i) => <Cell key={i} fill={pieColors[i]} />)}
-                  </Pie>
-                </PieChart>
-              </ResponsiveContainer>
+          {/* Horizon nudge buttons */}
+          <div className="mt-3 flex items-center gap-2">
+            <button
+              onClick={() => setHorizonY(h => Math.max(5, h - 5))}
+              className="px-3 py-1.5 rounded-lg border text-sm"
+            >
+              −5
+            </button>
+            <button
+              onClick={() => setHorizonY(h => Math.min(50, h + 5))}
+              className="px-3 py-1.5 rounded-lg border text-sm"
+            >
+              +5
+            </button>
+          </div>
+
+          {/* Sliders */}
+          <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
+            <div className="rounded-xl border p-4">
+              <div className="text-sm text-gray-600 mb-2">Monthly Contribution</div>
+              <div className="text-right text-sm font-medium mb-1">{CAD(monthly)}</div>
+              <input
+                type="range"
+                min={0}
+                max={10000}
+                step={50}
+                value={monthly}
+                onChange={(e) => setMonthly(Number(e.target.value))}
+                className="w-full"
+              />
             </div>
-            <div className="text-center text-lg font-semibold">Total {CAD(totalEquity)}</div>
-            <div className="mt-2 flex justify-center gap-4 text-sm">
-              <div className="flex items-center gap-1"><span className="inline-block h-3 w-3 rounded-full" style={{ background: pieColors[0] }} /> TFSA</div>
-              <div className="flex items-center gap-1"><span className="inline-block h-3 w-3 rounded-full" style={{ background: pieColors[1] }} /> RRSP</div>
-              <div className="flex items-center gap-1"><span className="inline-block h-3 w-3 rounded-full" style={{ background: pieColors[2] }} /> RESP</div>
+            <div className="rounded-xl border p-4">
+              <div className="text-sm text-gray-600 mb-2">Annual Growth</div>
+              <div className="text-right text-sm font-medium mb-1">{growth}%</div>
+              <input
+                type="range"
+                min={0}
+                max={20}
+                step={0.5}
+                value={growth}
+                onChange={(e) => setGrowth(Number(e.target.value))}
+                className="w-full"
+              />
             </div>
           </div>
         </div>
 
-        {/* Sliders */}
-        <div className="mt-6 grid grid-cols-1 lg:grid-cols-2 gap-6">
-          <div className="rounded-xl border p-4">
-            <div className="flex items-center justify-between mb-2">
-              <span className="text-sm font-medium">Monthly Contribution</span>
-              <span className="text-sm">{CAD(monthlyContribution)}</span>
-            </div>
-            <input
-              type="range"
-              min={0}
-              max={10000}
-              step={100}
-              value={monthlyContribution}
-              onChange={(e) => setMonthlyContribution(Number(e.target.value))}
-              className="w-full"
-            />
+        {/* Donut */}
+        <div className="rounded-2xl border bg-white p-4 shadow-sm">
+          <div className="text-lg font-semibold mb-2">Account Allocation</div>
+          <div className="h-[320px]">
+            <ResponsiveContainer width="100%" height="100%">
+              <PieChart>
+                <Pie
+                  data={donut}
+                  dataKey="value"
+                  nameKey="name"
+                  innerRadius={70}
+                  outerRadius={105}
+                  paddingAngle={2}
+                  stroke="#ffffff"
+                  isAnimationActive={false}
+                >
+                  {donut.map((d, i) => (
+                    <Cell key={i} fill={d.color} />
+                  ))}
+                </Pie>
+                <Legend
+                  verticalAlign="bottom"
+                  align="center"
+                  iconType="circle"
+                />
+              </PieChart>
+            </ResponsiveContainer>
           </div>
-
-          <div className="rounded-xl border p-4">
-            <div className="flex items-center justify-between mb-2">
-              <span className="text-sm font-medium">Annual Growth</span>
-              <span className="text-sm">{annualGrowth}%</span>
-            </div>
-            <input
-              type="range"
-              min={0}
-              max={20}
-              step={0.5}
-              value={annualGrowth}
-              onChange={(e) => setAnnualGrowth(Number(e.target.value))}
-              className="w-full"
-            />
+          <div className="text-center text-sm text-gray-600 mt-1">
+            <span className="font-medium">Total {CAD(alloc.total)}</span>
+            {loadingAlloc ? ' • loading…' : null}
           </div>
         </div>
       </section>
